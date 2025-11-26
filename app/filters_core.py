@@ -1,75 +1,77 @@
-import pandas as pd
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, auto
+from typing import Any, List, Tuple
+
+import pandas as pd
 
 
-class Operator(str, Enum):
-    CONTAINS = "contains"
-    EQUALS = "equals"
-    NOT_EQUALS = "not_equals"
-    GREATER = "greater"
-    LESS = "less"
-    RANGE = "range"
-    IS_TRUE = "is_true"
-    IS_FALSE = "is_false"
-    NOT_NULL = "not_null"
-    IS_NULL = "is_null"
+class Operator(Enum):
+    CONTAINS = auto()
+    EQUALS = auto()
+    NOT_EQUALS = auto()
+    RANGE = auto()  # в основному для діапазону дат
 
 
 @dataclass
 class FilterCondition:
     column: str
     operator: Operator
-    value: any = None
+    value: Any  # для RANGE очікуємо Tuple[start, end]
 
 
-def apply_filters(df: pd.DataFrame, conditions: list[FilterCondition]) -> pd.DataFrame:
-    if not conditions:
+def _apply_single_condition(df: pd.DataFrame, cond: FilterCondition) -> pd.DataFrame:
+    col = cond.column
+    if col not in df.columns:
         return df
 
-    mask = pd.Series([True] * len(df), index=df.index)
+    series = df[col]
+    op = cond.operator
+    val = cond.value
 
-    for cond in conditions:
-        col = df[cond.column]
+    # --------- Діапазон (включно з датами в текстових полях) ---------
+    if op == Operator.RANGE:
+        start, end = val  # (можуть бути None / None)
 
-        if cond.operator == Operator.CONTAINS:
-            m = col.astype(str).str.contains(str(cond.value), case=False, na=False)
-
-        elif cond.operator == Operator.EQUALS:
-            m = col == cond.value
-
-        elif cond.operator == Operator.NOT_EQUALS:
-            m = col != cond.value
-
-        elif cond.operator == Operator.GREATER:
-            m = col > cond.value
-
-        elif cond.operator == Operator.LESS:
-            m = col < cond.value
-
-        elif cond.operator == Operator.RANGE:
-            start, end = cond.value
-            m = pd.Series([True] * len(df), index=df.index)
-            if start is not None:
-                m &= col >= start
-            if end is not None:
-                m &= col <= end
-
-        elif cond.operator == Operator.IS_TRUE:
-            m = col == True
-
-        elif cond.operator == Operator.IS_FALSE:
-            m = col == False
-
-        elif cond.operator == Operator.NOT_NULL:
-            m = col.notna()
-
-        elif cond.operator == Operator.IS_NULL:
-            m = col.isna()
-
+        # Якщо стовпець уже datetime64 – використовуємо напряму
+        if pd.api.types.is_datetime64_any_dtype(series):
+            date_series = series
         else:
-            m = pd.Series([True] * len(df), index=df.index)
+            # Спроба витягнути першу дату формату дд.мм.рррр з тексту
+            extracted = series.astype(str).str.extract(r"(\d{2}\.\d{2}\.\d{4})")[0]
+            date_series = pd.to_datetime(
+                extracted, format="%d.%m.%Y", errors="coerce"
+            )
 
-        mask &= m
+        mask = pd.Series(True, index=df.index)
 
-    return df[mask]
+        if start is not None:
+            mask &= date_series >= start
+        if end is not None:
+            mask &= date_series <= end
+
+        return df[mask]
+
+    # --------- Містить ---------
+    if op == Operator.CONTAINS:
+        text = str(val)
+        return df[series.astype(str).str.contains(text, case=False, na=False)]
+
+    # --------- Дорівнює ---------
+    if op == Operator.EQUALS:
+        return df[series == val]
+
+    # --------- Не дорівнює ---------
+    if op == Operator.NOT_EQUALS:
+        return df[series != val]
+
+    return df
+
+
+def apply_filters(df: pd.DataFrame, conditions: List[FilterCondition]) -> pd.DataFrame:
+    """Застосувати список умов послідовно."""
+    result = df
+    for cond in conditions:
+        result = _apply_single_condition(result, cond)
+        if result.empty:
+            break
+    return result

@@ -5,12 +5,11 @@ from docx import Document
 
 def _load_from_docx(path: str) -> pd.DataFrame:
     """
-    Загрузить первую "нормальную" таблицу из .docx в DataFrame.
-    Ожидается прямоугольная таблица без хитрых объединений (как мы сами экспортируем из приложения).
+    Загрузить первую осмысленную таблицу из .docx в DataFrame.
+    Ожидается прямоугольная таблица (как твой реєстр).
     """
     doc = Document(path)
 
-    # берём первую таблицу, где есть хотя бы 2 строки (заголовок + данные)
     table = None
     for t in doc.tables:
         if len(t.rows) >= 2:
@@ -20,14 +19,12 @@ def _load_from_docx(path: str) -> pd.DataFrame:
     if table is None:
         raise ValueError("У документі Word не знайдено підходящої таблиці.")
 
-    # заголовки — первая строка
     headers = [cell.text.strip() for cell in table.rows[0].cells]
-
     rows = []
+
     for row in table.rows[1:]:
         values = [cell.text.strip() for cell in row.cells]
 
-        # подгоняем длину под количество колонок
         if len(values) < len(headers):
             values += [""] * (len(headers) - len(values))
         elif len(values) > len(headers):
@@ -41,10 +38,10 @@ def _load_from_docx(path: str) -> pd.DataFrame:
 
 def load_test_df(path: str = "registry_test.csv") -> pd.DataFrame:
     """
-    Универсальный загрузчик:
+    Универсальная загрузка:
     - .csv
     - .xlsx / .xls
-    - .docx (Word-таблица)
+    - .docx (таблица Word)
     """
     ext = os.path.splitext(path)[1].lower()
 
@@ -55,19 +52,46 @@ def load_test_df(path: str = "registry_test.csv") -> pd.DataFrame:
     elif ext == ".docx":
         df = _load_from_docx(path)
     else:
-        # по умолчанию пробуем csv
         df = pd.read_csv(path)
 
-    # Приводим даты к datetime (чтобы фильтры по датам работали)
-    date_cols = ["Дата_нар", "Дата_виїзду", "Дата_оголошення_в_розшук"]
+    # Примерный набор дат (под твой реєстр, можно расширить по факту)
+    date_cols = [
+        "Дата_реєстрації",
+        "Дата_нар",
+        "Дата_повідомлення_підозри",
+        "Дата_зупинення",
+        "Дата_доручення_розшуку",
+        "Дата_заведення_ОРС",
+        "Дата_інфо_про_перетин",
+        "Дата_адмін",
+        "Дата_міжнар_розшуку",
+        "Дата_виїзду",
+        "Дата_оголошення_в_розшук",
+    ]
     for col in date_cols:
         if col in df.columns:
-            # умеет парсить и форматы типу "2024-01-01", и "01.01.2024"
             df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
 
-    # Булеві поля (наш експорт пише "Так"/"Ні")
-    bool_map = {"Так": True, "Ні": False, "True": True, "False": False}
-    for bcol in ["Є_виїзд_за_кордон", "Є_Інтерпол"]:
+    # Булеві (Так/Ні) – можно расширить список
+    bool_map = {
+        "Так": True,
+        "так": True,
+        "ТАК": True,
+        "Ні": False,
+        "ні": False,
+        "НІ": False,
+        "True": True,
+        "False": False,
+        True: True,
+        False: False,
+    }
+    bool_cols = [
+        "Є_виїзд_за_кордон",
+        "Є_Інтерпол",
+        "Є_інфо_про_перетин_кордону",
+        "Є_адмін_відповідальність",
+    ]
+    for bcol in bool_cols:
         if bcol in df.columns:
             df[bcol] = df[bcol].map(bool_map).fillna(False).astype(bool)
 

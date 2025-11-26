@@ -1,58 +1,100 @@
 import datetime
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Set
 
 import numpy as np
 import pandas as pd
-from PySide6.QtCore import QAbstractTableModel, Qt, QModelIndex
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PySide6.QtGui import QBrush, QColor
 
 
 class PandasTableModel(QAbstractTableModel):
+    """
+    Табличная модель для отображения pandas.DataFrame в QTableView.
+
+    Возможности:
+    - отображение и редактирование данных;
+    - auto-format дат -> дд.мм.рррр;
+    - отображение boolean -> Так / Ні;
+    - подсветка строк, где сроки спливают (highlight_indices).
+    - обратная связь через edit_callback — изменение отражается в df_original.
+    """
+
     def __init__(
         self,
         df: pd.DataFrame,
         parent=None,
         edit_callback: Optional[Callable[[Any, str, Any], None]] = None,
+        highlight_indices: Optional[Set[Any]] = None,
     ):
-        """
-        df            – DataFrame, который отображаем и редактируем
-        edit_callback – функция (orig_index, column_name, new_value),
-                        чтобы MainWindow мог обновить df_original
-        """
         super().__init__(parent)
         self._df = df
         self._edit_callback = edit_callback
+        self._highlight_indices: Set[Any] = highlight_indices or set()
 
-    # ---------- базовые методы ----------
+    # =============================
+    # Базовые методы модели
+    # =============================
 
-    def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self._df)
+    def rowCount(self, parent=QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self._df)
 
-    def columnCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self._df.columns)
+    def columnCount(self, parent=QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self._df.columns)
+
+    # =============================
+    # Отображение данных
+    # =============================
 
     def data(self, index: QModelIndex, role=Qt.DisplayRole) -> Any:
         if not index.isValid():
             return None
 
-        if role == Qt.DisplayRole or role == Qt.EditRole:
-            value = self._df.iat[index.row(), index.column()]
+        row = index.row()
+        col = index.column()
+        series = self._df.iloc[:, col]
+
+        if role in (Qt.DisplayRole, Qt.EditRole):
+            value = self._df.iat[row, col]
 
             if pd.isna(value):
                 return ""
 
-            # даты → дд.мм.рррр
+            # даты -> дд.мм.рррр
             if isinstance(value, (pd.Timestamp, datetime.datetime, datetime.date)):
-                return value.strftime("%d.%m.%Y")
+                try:
+                    return value.strftime("%d.%m.%Y")
+                except Exception:
+                    return str(value)
 
-            # bool → Так / Ні
+            # bool -> Так / Ні
             if isinstance(value, (bool, np.bool_)):
                 return "Так" if value else "Ні"
 
             return str(value)
 
+        # =============================
+        # Подсветка строк (expiring)
+        # =============================
+        if role == Qt.BackgroundRole and self._highlight_indices:
+            try:
+                orig_index = self._df.index[row]
+                if orig_index in self._highlight_indices:
+                    # Полупрозрачный красный
+                    return QBrush(QColor(255, 0, 0, 60))
+            except Exception:
+                pass
+
         return None
 
-    def headerData(self, section, orientation, role=Qt.DisplayRole):
+    # =============================
+    # Заголовки
+    # =============================
+
+    def headerData(self, section: int, orientation, role=Qt.DisplayRole):
         if role != Qt.DisplayRole:
             return None
 
@@ -61,16 +103,14 @@ class PandasTableModel(QAbstractTableModel):
         else:
             return str(section + 1)
 
-    # ---------- редактирование ----------
+    # =============================
+    # Редактирование
+    # =============================
 
     def flags(self, index: QModelIndex):
         if not index.isValid():
             return Qt.ItemIsEnabled
-        return (
-            Qt.ItemIsEnabled
-            | Qt.ItemIsSelectable
-            | Qt.ItemIsEditable  # разрешаем редактирование
-        )
+        return Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
 
     def setData(self, index: QModelIndex, value, role=Qt.EditRole) -> bool:
         if role != Qt.EditRole or not index.isValid():
@@ -82,23 +122,25 @@ class PandasTableModel(QAbstractTableModel):
         series = self._df[col_name]
 
         text = str(value).strip()
-
-        # Пытаемся привести к правильному типу
         new_val: Any = text
 
         try:
+            # datetime
             if pd.api.types.is_datetime64_any_dtype(series):
                 if text == "":
                     new_val = pd.NaT
                 else:
-                    # ожидаем формат дд.мм.рррр
-                    new_val = pd.to_datetime(text, format="%d.%m.%Y")
+                    new_val = pd.to_datetime(text, format="%d.%m.%Y", dayfirst=True)
+
+            # boolean
             elif pd.api.types.is_bool_dtype(series):
                 if text == "":
                     new_val = False
                 else:
                     t = text.lower()
                     new_val = t in ("так", "true", "1", "yes", "y", "+")
+
+            # numeric
             elif pd.api.types.is_numeric_dtype(series):
                 if text == "":
                     new_val = np.nan
@@ -107,30 +149,38 @@ class PandasTableModel(QAbstractTableModel):
                         new_val = int(text)
                     except ValueError:
                         new_val = float(text)
+
+            # everything else
             else:
-                # обычный текст
                 new_val = text
+
         except Exception:
-            # если что-то не так – оставляем как текст
             new_val = text
 
-        # Обновляем текущий df (отфильтрованный)
+        # Записываем в DataFrame
         self._df.iat[row, col] = new_val
 
-        # Коллбек в MainWindow, чтобы обновить df_original
+        # callback — синхронизация с df_original в MainWindow
         if self._edit_callback is not None:
-            orig_index = self._df.index[row]  # индекс в оригинальном df
+            orig_index = self._df.index[row]
             self._edit_callback(orig_index, col_name, new_val)
 
+        # уведомляем View об изменении
         self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
         return True
 
-    # ---------- обновление целого df ----------
+    # =============================
+    # Полная замена DataFrame
+    # =============================
 
-    def update_df(self, df: pd.DataFrame):
-        """Обновить данные в таблице (после фильтрации/редактирования)."""
+    def update_df(self, df: pd.DataFrame, highlight_indices: Optional[Set[Any]] = None):
+        """
+        Обновляет внутренний df модели + список строк, которые подсвечиваются.
+        """
         self.beginResetModel()
         self._df = df
+        if highlight_indices is not None:
+            self._highlight_indices = highlight_indices
         self.endResetModel()
 
     @property
