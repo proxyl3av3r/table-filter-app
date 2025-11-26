@@ -1,0 +1,6 @@
+pandas
+PySide6
+openpyxl
+xlrd
+python-docx
+pyinstaller
