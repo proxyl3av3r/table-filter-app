@@ -6,17 +6,17 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-windows:
+  build:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout source
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
@@ -25,13 +25,13 @@ jobs:
           pip install pyinstaller
 
       - name: Build EXE with PyInstaller
-        run: |
-          pyinstaller app/main.py ^
-            --name "TableFilterEngine" ^
-            --onefile ^
-            --noconsole ^
-            --icon app\\assets\\cyberpolice_notebook.ico ^
-            --add-data "app/assets;assets"
+        run: >
+          pyinstaller app/main.py
+          --name TableFilterEngine
+          --onefile
+          --noconsole
+          --icon app/assets/cyberpolice_notebook.ico
+          --add-data "app/assets;assets"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
