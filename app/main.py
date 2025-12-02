@@ -182,7 +182,7 @@ class MatchAnalysisDialog(QDialog):
 
         self.btn_use_current = QPushButton("Використати поточну таблицю")
         self.btn_load_table = QPushButton("Завантажити таблицю…")
-        self.btn_load_doc = QPushButton("Завантажити документ справа…")
+        self.btn_load_doc = QPushButton("Завантажити документ на порівняння…")
 
         self.btn_find_matches = QPushButton("Знайти збіги")
         self.btn_find_matches.setEnabled(False)
@@ -892,42 +892,74 @@ class MainWindow(QMainWindow):
 
         root.addLayout(main)
 
-        # ЛЕГЕНДА ЦВЕТІВ
-        legend = QLabel(
-            "Легенда кольорів:<br>"
-            "<span style='background:#ffcccc;'>  </span> &nbsp; Строк спливає (червоний)<br>"
-            "<span style='background:#cce0ff;'>  </span> &nbsp; Прострочено (синій)<br>"
-            "<span style='background:#ffd799;'>  </span> &nbsp; Дублікати ПІБ (жовтий)<br>"
-            "<span style='background:#e5ccff;'>  </span> &nbsp; Архів (зелений)<br>"
+        # добавили основной layout main выше
+        root.addLayout(main)
+
+        # ---- Нижня панель: кнопка легенди + лого ----
+        bottom_bar = QHBoxLayout()
+        bottom_bar.setContentsMargins(4, 2, 4, 2)
+        bottom_bar.setSpacing(6)
+
+        # Кнопка для открытия легенды кольорів
+        self.btn_show_legend = QPushButton("Легенда кольорів")
+        self.btn_show_legend.setFlat(True)
+        self.btn_show_legend.setCursor(Qt.PointingHandCursor)
+        self.btn_show_legend.setStyleSheet(
+            "QPushButton { "
+            "border: none; "
+            "color: #555; "
+            "font-size: 11px; "
+            "text-decoration: underline; "
+            "padding: 0 4px; "
+            "} "
+            "QPushButton:hover { color: #111; }"
         )
-        legend.setStyleSheet("font-size: 11px; color: #444;")
-        root.addWidget(legend)
+        self.btn_show_legend.clicked.connect(self.show_colors_legend)
+        bottom_bar.addWidget(self.btn_show_legend)
 
-        # Нижній правий кут — логотип + копірайт
-        footer = QHBoxLayout()
-        footer.setSpacing(8)
-        footer.addStretch()
+        # пустое пространство по центру
+        bottom_bar.addStretch()
 
+        # Логотип (уменьшенный)
         logo_label = QLabel()
         logo_path = resource_path("assets/national.png")
         if logo_path.exists():
             pm = QPixmap(str(logo_path))
             if not pm.isNull():
-                pm = pm.scaledToHeight(60, Qt.SmoothTransformation)
+                pm = pm.scaledToHeight(36, Qt.SmoothTransformation)
                 logo_label.setPixmap(pm)
-        footer.addWidget(logo_label)
+        bottom_bar.addWidget(logo_label)
 
+        # Подпись ©
         copyright_label = QLabel("© Cybersheeld")
-        copyright_label.setStyleSheet("color: #555; font-size: 11px;")
-        footer.addWidget(copyright_label)
+        copyright_label.setStyleSheet("color: #555; font-size: 10px;")
+        bottom_bar.addWidget(copyright_label)
 
-        root.addLayout(footer)
+        root.addLayout(bottom_bar)
 
         self.setCentralWidget(central)
+
+    # ======================================================================
+    #  ВСПЛЫВАЮЩЕЕ ОКНО: ЛЕГЕНДА ЦВЕТОВ ТАБЛИЦЫ
+    # ======================================================================
+    def show_colors_legend(self):
+        """
+        Открывает всплывающее окно с описанием цветовой схемы,
+        используемой в основной таблице.
+        """
+        QMessageBox.information(
+            self,
+            "Легенда кольорів",
+            "Строк спливає – червоний фон\n"
+            "Прострочено – синій фон\n"
+            "Дублікат ПІБ – жовтий фон\n"
+            "Архів – зелений фон\n"
+        )
 
     # --------------------------------------------------------
     #                    ДОПОМІЖНІ МЕТОДИ
     # --------------------------------------------------------
+    
 
     def _is_date_like_column(self, series: pd.Series) -> bool:
         """
