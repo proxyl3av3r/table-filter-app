@@ -153,8 +153,10 @@ class AddRowDialog(QDialog):
 
 class MatchAnalysisDialog(QDialog):
     """
-    Аналіз збігів ПІБ між лівою таблицею та зовнішнім документом.
-    Зліва — таблиця, справа — текст або таблиця з документа.
+    Аналіз збігів між лівою таблицею та зовнішнім документом.
+    Режими:
+      - ПІБ (за прізвищем/ПІБ)
+      - ОРС (за номером ОРС з 8-ї колонки)
     """
 
     def __init__(self, parent=None, current_df: pd.DataFrame | None = None):
@@ -162,27 +164,37 @@ class MatchAnalysisDialog(QDialog):
         self.setWindowTitle("Аналіз збігів")
         self.resize(1400, 820)
 
-        # основні дані
+        # === основні дані ===
         self.current_df = current_df
-        self.left_df: pd.DataFrame | None = None
-        self.right_text: str = ""
-        self.right_df: pd.DataFrame | None = None
+        self.left_df: pd.DataFrame | None = None       # таблиця зліва
+        self.right_text: str = ""                      # суцільний текст документа справа
+        self.right_df: pd.DataFrame | None = None      # таблиця з документа (якщо є)
 
-        # списки результатів
-        # matches: (index у left_df, ПІБ)
-        self.matches: list[tuple[int, str]] = []
-        self.unique_rows: pd.DataFrame | None = None
+        # --- результати по ПІБ ---
+        # список збігів: (index у left_df, ПІБ)
+        self.pib_matches: list[tuple[int, str]] = []
+        self.pib_unique_rows: pd.DataFrame | None = None
 
-        # для циклического перехода по вхождениям унікальних ПІБ
-        # ключ: name_lower, значение: индекс позиции в списке positions
-        self._unique_search_state: dict[str, int] = {}
+        # --- результати по ОРС ---
+        # список збігів: (index у left_df, номер_ОРС_як_рядок)
+        self.ors_matches: list[tuple[int, str]] = []
+        self.ors_unique_rows: pd.DataFrame | None = None
 
-        # === верхні кнопки ===
+        # для циклічного переходу по вхождениях унікальних ПІБ / ОРС
+        # ключ: (mode, name_lower), значення: номер поточного входження
+        self._unique_pos_index: dict[tuple[str, str], int] = {}
+
+        # поточний режим вкладки внизу: "pib" або "ors"
+        self.current_mode: str = "pib"
+
+        # --------------------------------------------------------
+        #                      ВЕРХНЯ ПАНЕЛЬ
+        # --------------------------------------------------------
         top = QHBoxLayout()
 
         self.btn_use_current = QPushButton("Використати поточну таблицю")
         self.btn_load_table = QPushButton("Завантажити таблицю…")
-        self.btn_load_doc = QPushButton("Завантажити документ на порівняння…")
+        self.btn_load_doc = QPushButton("Завантажити документ справа…")
 
         self.btn_find_matches = QPushButton("Знайти збіги")
         self.btn_find_matches.setEnabled(False)
@@ -198,8 +210,11 @@ class MatchAnalysisDialog(QDialog):
         self.btn_load_doc.clicked.connect(self.load_right_document)
         self.btn_find_matches.clicked.connect(self.find_matches)
 
-        # === центральна частина (splitter) ===
+        # --------------------------------------------------------
+        #                    ЦЕНТРАЛЬНА ЧАСТИНА
+        # --------------------------------------------------------
 
+        # ліва таблиця
         self.left_table = QTableView()
         self.left_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.left_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -221,6 +236,7 @@ class MatchAnalysisDialog(QDialog):
         self.right_tabs.addTab(self.right_table, "Таблиця")
         self.right_tabs.setTabEnabled(1, False)
 
+        # спліттер для середини
         center_splitter = QSplitter(Qt.Horizontal)
         left_panel = QWidget()
         lp = QVBoxLayout(left_panel)
@@ -237,55 +253,116 @@ class MatchAnalysisDialog(QDialog):
         center_splitter.setStretchFactor(0, 3)
         center_splitter.setStretchFactor(1, 2)
 
-        # === нижня частина — списки збігів та унікальних ===
+        # --------------------------------------------------------
+        #                 НИЖНЯ ЧАСТИНА (ДВІ ВКЛАДКИ)
+        # --------------------------------------------------------
 
-        bottom = QSplitter(Qt.Horizontal)
+        self.bottom_tabs = QTabWidget()
+        self.bottom_tabs.currentChanged.connect(self.on_bottom_tab_changed)
 
-        # Збіги ПІБ
-        match_panel = QWidget()
-        mp = QVBoxLayout(match_panel)
-        mp.setContentsMargins(0, 0, 0, 0)
+        # --- вкладка ПІБ ---
+        pib_tab = QWidget()
+        pib_layout = QVBoxLayout(pib_tab)
+        pib_layout.setContentsMargins(0, 0, 0, 0)
 
-        mp.addWidget(QLabel("Збіги ПІБ:"))
-        self.list_matches = QListWidget()
-        mp.addWidget(self.list_matches)
+        bottom_pib_splitter = QSplitter(Qt.Horizontal)
 
-        # Унікальні
-        unique_panel = QWidget()
-        up = QVBoxLayout(unique_panel)
-        up.setContentsMargins(0, 0, 0, 0)
+        match_panel_pib = QWidget()
+        mp_pib = QVBoxLayout(match_panel_pib)
+        mp_pib.setContentsMargins(0, 0, 0, 0)
+        mp_pib.addWidget(QLabel("Збіги ПІБ:"))
+        self.list_matches_pib = QListWidget()
+        mp_pib.addWidget(self.list_matches_pib)
 
-        up.addWidget(QLabel("Рядки, яких немає в документі:"))
-        self.list_unique = QListWidget()
-        self.list_unique.itemSelectionChanged.connect(self.on_unique_selected)
-        up.addWidget(self.list_unique)
+        unique_panel_pib = QWidget()
+        up_pib = QVBoxLayout(unique_panel_pib)
+        up_pib.setContentsMargins(0, 0, 0, 0)
+        up_pib.addWidget(QLabel("Рядки, яких немає в документі (ПІБ):"))
+        self.list_unique_pib = QListWidget()
+        up_pib.addWidget(self.list_unique_pib)
 
-        self.btn_export_unique = QPushButton("Експорт унікальних у CSV/Excel")
-        self.btn_export_unique.setEnabled(False)
-        up.addWidget(self.btn_export_unique)
+        self.btn_export_unique_pib = QPushButton("Експорт унікальних у CSV/Excel")
+        self.btn_export_unique_pib.setEnabled(False)
+        up_pib.addWidget(self.btn_export_unique_pib)
 
-        self.btn_export_unique.clicked.connect(self.export_unique_rows)
+        bottom_pib_splitter.addWidget(match_panel_pib)
+        bottom_pib_splitter.addWidget(unique_panel_pib)
+        bottom_pib_splitter.setStretchFactor(0, 1)
+        bottom_pib_splitter.setStretchFactor(1, 1)
 
-        self.list_matches.itemSelectionChanged.connect(self.on_match_selected)
+        pib_layout.addWidget(bottom_pib_splitter)
 
-        bottom.addWidget(match_panel)
-        bottom.addWidget(unique_panel)
-        bottom.setStretchFactor(0, 1)
-        bottom.setStretchFactor(1, 1)
+        # --- вкладка ОРС ---
+        ors_tab = QWidget()
+        ors_layout = QVBoxLayout(ors_tab)
+        ors_layout.setContentsMargins(0, 0, 0, 0)
 
-        # === Головний layout ===
+        bottom_ors_splitter = QSplitter(Qt.Horizontal)
+
+        match_panel_ors = QWidget()
+        mp_ors = QVBoxLayout(match_panel_ors)
+        mp_ors.setContentsMargins(0, 0, 0, 0)
+        mp_ors.addWidget(QLabel("Збіги ОРС:"))
+        self.list_matches_ors = QListWidget()
+        mp_ors.addWidget(self.list_matches_ors)
+
+        unique_panel_ors = QWidget()
+        up_ors = QVBoxLayout(unique_panel_ors)
+        up_ors.setContentsMargins(0, 0, 0, 0)
+        up_ors.addWidget(QLabel("Рядки, яких немає в документі (ОРС):"))
+        self.list_unique_ors = QListWidget()
+        up_ors.addWidget(self.list_unique_ors)
+
+        self.btn_export_unique_ors = QPushButton("Експорт унікальних у CSV/Excel")
+        self.btn_export_unique_ors.setEnabled(False)
+        up_ors.addWidget(self.btn_export_unique_ors)
+
+        bottom_ors_splitter.addWidget(match_panel_ors)
+        bottom_ors_splitter.addWidget(unique_panel_ors)
+        bottom_ors_splitter.setStretchFactor(0, 1)
+        bottom_ors_splitter.setStretchFactor(1, 1)
+
+        ors_layout.addWidget(bottom_ors_splitter)
+
+        # додаємо вкладки внизу
+        self.bottom_tabs.addTab(pib_tab, "ПІБ")
+        self.bottom_tabs.addTab(ors_tab, "ОРС")
+
+        # --- сигнали для списків ---
+        self.list_matches_pib.itemSelectionChanged.connect(
+            lambda: self.on_match_selected("pib")
+        )
+        self.list_unique_pib.itemSelectionChanged.connect(
+            lambda: self.on_unique_selected("pib")
+        )
+        self.btn_export_unique_pib.clicked.connect(
+            lambda: self.export_unique_rows("pib")
+        )
+
+        self.list_matches_ors.itemSelectionChanged.connect(
+            lambda: self.on_match_selected("ors")
+        )
+        self.list_unique_ors.itemSelectionChanged.connect(
+            lambda: self.on_unique_selected("ors")
+        )
+        self.btn_export_unique_ors.clicked.connect(
+            lambda: self.export_unique_rows("ors")
+        )
+
+        # --------------------------------------------------------
+        #                   ГОЛОВНИЙ LAYOUT ДІАЛОГУ
+        # --------------------------------------------------------
         layout = QVBoxLayout(self)
         layout.addLayout(top)
         layout.addWidget(center_splitter, 3)
-        layout.addWidget(bottom, 2)
+        layout.addWidget(self.bottom_tabs, 2)
 
         # Якщо була таблиця з головного — вставляємо
         if self.current_df is not None:
             self.set_left_df(self.current_df)
 
-
     # ============================================================
-    # ЛІВА ТАБЛИЦЯ
+    #                      ЛІВА ТАБЛИЦЯ
     # ============================================================
 
     def set_left_df(self, df: pd.DataFrame):
@@ -318,7 +395,7 @@ class MatchAnalysisDialog(QDialog):
             QMessageBox.critical(self, "Помилка", str(e))
 
     # ============================================================
-    # ЗАВАНТАЖЕННЯ ДОКУМЕНТА СПРАВА
+    #                 ЗАВАНТАЖЕННЯ ДОКУМЕНТА СПРАВА
     # ============================================================
 
     def load_right_document(self):
@@ -347,7 +424,6 @@ class MatchAnalysisDialog(QDialog):
                 else:
                     df = pd.read_excel(path, dtype=str).fillna("")
                 table = df
-
                 rows = df.apply(lambda r: " ".join(r.values.astype(str)), axis=1)
                 text = "\n".join(rows)
 
@@ -405,26 +481,61 @@ class MatchAnalysisDialog(QDialog):
             QMessageBox.critical(self, "Помилка", str(e))
 
     # ============================================================
-    # ПОШУК ЗБІГІВ
+    #                      ОБРОБКА ВКЛАДОК ВНИЗУ
+    # ============================================================
+
+    def on_bottom_tab_changed(self, index: int):
+        self.current_mode = "pib" if index == 0 else "ors"
+
+    # ============================================================
+    #                        ПОШУК ЗБІГІВ
     # ============================================================
 
     def find_matches(self):
+        """
+        Запускає аналіз по обох режимах: ПІБ та ОРС.
+        """
         if self.left_df is None or not self.right_text.strip():
             QMessageBox.warning(self, "Помилка", "Потрібна таблиця зліва та документ справа.")
             return
 
+        self._unique_pos_index.clear()
+
+        # --- ПІБ ---
+        self._find_pib_matches()
+
+        # --- ОРС ---
+        self._find_ors_matches()
+
+        # за замовчуванням показуємо вкладку ПІБ
+        self.bottom_tabs.setCurrentIndex(0)
+        self.current_mode = "pib"
+
+        # підсвічуємо всі збіги ПІБ у тексті
+        self.highlight_all_pib_matches()
+
+        if not self.pib_matches and not self.ors_matches:
+            QMessageBox.information(self, "Готово", "Збігів не знайдено.")
+
+    # --- внутрішній аналіз по ПІБ ---
+
+    def _find_pib_matches(self):
         pib_col = next((c for c in self.left_df.columns if "ПІБ" in str(c)), None)
         if pib_col is None:
-            QMessageBox.warning(self, "Помилка", "Колонку ПІБ не знайдено.")
+            # без ПІБ просто очищаємо вкладку
+            self.pib_matches = []
+            self.pib_unique_rows = None
+            self.list_matches_pib.clear()
+            self.list_unique_pib.clear()
+            self.btn_export_unique_pib.setEnabled(False)
             return
 
         series = self.left_df[pib_col].astype(str)
         text_lower = self.right_text.lower()
 
-        self.matches.clear()
-        self.list_matches.clear()
-        self.list_unique.clear()
-        self._unique_search_state.clear()
+        self.pib_matches.clear()
+        self.list_matches_pib.clear()
+        self.list_unique_pib.clear()
 
         for idx, val in series.items():
             name = val.split(",")[0].strip()
@@ -433,30 +544,75 @@ class MatchAnalysisDialog(QDialog):
             name_lower = name.lower()
             if name_lower in text_lower:
                 count = text_lower.count(name_lower)
-                self.matches.append((idx, name))
-                self.list_matches.addItem(f"{idx}: {name} ({count})")
+                self.pib_matches.append((idx, name))
+                self.list_matches_pib.addItem(f"{idx}: {name} ({count})")
 
-        # Унікальні (рядки лівої таблиці, які не зустрілись у документі)
-        matched_idx = {i for i, _ in self.matches}
-        self.unique_rows = self.left_df[~self.left_df.index.isin(matched_idx)].copy()
-        for idx, row in self.unique_rows.iterrows():
-            self.list_unique.addItem(f"{idx}: {row[pib_col]}")
+        matched_idx = {i for i, _ in self.pib_matches}
+        self.pib_unique_rows = self.left_df[~self.left_df.index.isin(matched_idx)].copy()
+        for idx, row in self.pib_unique_rows.iterrows():
+            self.list_unique_pib.addItem(f"{idx}: {row[pib_col]}")
 
-        self.btn_export_unique.setEnabled(
-            self.unique_rows is not None and not self.unique_rows.empty
+        self.btn_export_unique_pib.setEnabled(
+            self.pib_unique_rows is not None and not self.pib_unique_rows.empty
         )
 
-        # підсвічуємо всі збіги жовтим
-        self.highlight_all_matches()
+    # --- внутрішній аналіз по ОРС ---
 
-        if not self.matches:
-            QMessageBox.information(self, "Готово", "Збігів не знайдено.")
+    def _find_ors_matches(self):
+        import re
+
+        # шукаємо колонку з ОРС
+        ors_col = next(
+            (c for c in self.left_df.columns
+             if "№ ОРС" in str(c) or "№ОРС" in str(c) or "ОРС" in str(c)),
+            None
+        )
+        if ors_col is None:
+            # немає колонки ОРС — чистимо вкладку
+            self.ors_matches = []
+            self.ors_unique_rows = None
+            self.list_matches_ors.clear()
+            self.list_unique_ors.clear()
+            self.btn_export_unique_ors.setEnabled(False)
+            return
+
+        series = self.left_df[ors_col].astype(str)
+        text_lower = self.right_text.lower()
+
+        self.ors_matches.clear()
+        self.list_matches_ors.clear()
+        self.list_unique_ors.clear()
+
+        for idx, val in series.items():
+            # беремо першу послідовність цифр як номер ОРС
+            m = re.search(r"\d+", val)
+            if not m:
+                continue
+            num = m.group(0).strip()
+            if not num:
+                continue
+
+            num_lower = num.lower()
+            if num_lower in text_lower:
+                count = text_lower.count(num_lower)
+                self.ors_matches.append((idx, num))
+                self.list_matches_ors.addItem(f"{idx}: {num} ({count})")
+
+        matched_idx = {i for i, _ in self.ors_matches}
+        self.ors_unique_rows = self.left_df[~self.left_df.index.isin(matched_idx)].copy()
+        for idx, row in self.ors_unique_rows.iterrows():
+            # показуємо весь текст з колонки ОРС для наочності
+            self.list_unique_ors.addItem(f"{idx}: {row[ors_col]}")
+
+        self.btn_export_unique_ors.setEnabled(
+            self.ors_unique_rows is not None and not self.ors_unique_rows.empty
+        )
 
     # ============================================================
-    # ПІДСВІЧЕННЯ ВСІХ ЗБІГІВ
+    #            ПІДСВІЧЕННЯ ВСІХ ЗБІГІВ (ЛИШЕ ДЛЯ ПІБ)
     # ============================================================
 
-    def highlight_all_matches(self):
+    def highlight_all_pib_matches(self):
         """Жовте підсвічення всіх ПІБ, які знайдені у тексті."""
         doc = self.right_text_edit.document()
 
@@ -464,7 +620,7 @@ class MatchAnalysisDialog(QDialog):
         cursor.select(QTextCursor.Document)
         cursor.setCharFormat(QTextCharFormat())
 
-        if not self.matches or not self.right_text:
+        if not self.pib_matches or not self.right_text:
             return
 
         fmt_yellow = QTextCharFormat()
@@ -472,7 +628,7 @@ class MatchAnalysisDialog(QDialog):
 
         text_lower = self.right_text.lower()
 
-        for _, name in self.matches:
+        for _, name in self.pib_matches:
             name_lower = name.lower()
             start = 0
             while True:
@@ -488,12 +644,21 @@ class MatchAnalysisDialog(QDialog):
                 start = pos + len(name)
 
     # ============================================================
-    # ВИБІР ЗІ СПИСКУ ЗБІГІВ
+    #           ВИБІР ЗІ СПИСКУ ЗБІГІВ (ПІБ / ОРС)
     # ============================================================
 
-    def on_match_selected(self):
-        item = self.list_matches.currentItem()
-        if not item or not self.matches:
+    def on_match_selected(self, mode: str):
+        """
+        mode: "pib" або "ors"
+        """
+        if mode == "pib":
+            item = self.list_matches_pib.currentItem()
+            matches = self.pib_matches
+        else:
+            item = self.list_matches_ors.currentItem()
+            matches = self.ors_matches
+
+        if not item or not matches:
             return
 
         idx_str, rest = item.text().split(":", 1)
@@ -514,7 +679,7 @@ class MatchAnalysisDialog(QDialog):
                     self.left_table.selectRow(r)
                     break
 
-        # 2) прокрутка правого тексту + м'яке виділення
+        # 2) прокрутка правого тексту
         self.scroll_to_in_text(name)
 
         # 3) якщо справа є таблиця — підсвічуємо там
@@ -522,43 +687,44 @@ class MatchAnalysisDialog(QDialog):
             self.highlight_in_right_table(name)
 
     # ============================================================
-    # ВИБІР УНІКАЛЬНОГО РЯДКА (ЦИКЛИЧНИЙ ПОШУК У ДОКУМЕНТІ)
+    #      ВИБІР УНІКАЛЬНОГО РЯДКА (ЦИКЛІЧНИЙ ПОШУК У ТЕКСТІ)
     # ============================================================
 
-    def on_unique_selected(self):
-        """Циклічний пошук унікального ПІБ у документі (підсвічення фіолетовим)
-        + прокрутка лівої таблиці до відповідного рядка."""
-        item = self.list_unique.currentItem()
+    def on_unique_selected(self, mode: str):
+        """
+        Циклічний пошук унікального ПІБ / ОРС у документі
+        (м'яке фіолетове підсвічення по всіх вхождениях).
+        """
+        if mode == "pib":
+            item = self.list_unique_pib.currentItem()
+        else:
+            item = self.list_unique_ors.currentItem()
+
         if not item:
             return
 
-        # формат: "7: Дор Олена Степанівна, 11.12.1975..."
+        # формат: "7: Дор Олена Степанівна, 11.12.1975..." або "7: 8925622 25.01.2024 ..."
         try:
-            idx_str, full_text = item.text().split(":", 1)
-            idx = int(idx_str)
+            _, full_text = item.text().split(":", 1)
             full_text = full_text.strip()
         except ValueError:
             return
 
-        # 1) прокрутка лівої таблиці до цього індексу
-        model = self.left_table.model()
-        if model and self.left_df is not None:
-            for r in range(model.rowCount()):
-                if self.left_df.index[r] == idx:
-                    index = model.index(r, 0)
-                    self.left_table.scrollTo(index)
-                    self.left_table.selectRow(r)
-                    break
+        # для ПІБ беремо ПІБ до першої коми, для ОРС — перше число або весь текст
+        import re
+        if mode == "pib":
+            name = full_text.split(",")[0].strip()
+        else:
+            m = re.search(r"\d+", full_text)
+            name = m.group(0).strip() if m else full_text
 
-        # Беремо тільки ПІБ до першої коми
-        name = full_text.split(",")[0].strip()
-        if not name or not self.right_text:
+        if not name:
             return
 
         name_lower = name.lower()
         text_lower = self.right_text.lower()
 
-        # ---- шукаємо всі входження у тексті ----
+        # всі вхождения
         positions = []
         start = 0
         while True:
@@ -572,28 +738,30 @@ class MatchAnalysisDialog(QDialog):
             QMessageBox.information(
                 self,
                 "Немає вхождень",
-                f"У документі не знайдено ПІБ:\n{name}",
+                f"У документі не знайдено:\n{name}",
             )
             return
 
-        # ---- циклічний перехід по входженнях для конкретного ПІБ ----
-        current_idx = self._unique_search_state.get(name_lower, -1)
-        current_idx = (current_idx + 1) % len(positions)
-        self._unique_search_state[name_lower] = current_idx
+        key = (mode, name_lower)
+        cur_idx = self._unique_pos_index.get(key, -1) + 1
+        if cur_idx >= len(positions):
+            cur_idx = 0
+        self._unique_pos_index[key] = cur_idx
+        pos = positions[cur_idx]
 
-        pos = positions[current_idx]
-
-        # спочатку вертаємо жовті підсвічування збігів
-        self.highlight_all_matches()
-
-        # фіолетове підсвічення ПІБ у вибраному входженні
+        # очищуємо форматування
         doc = self.right_text_edit.document()
+        cursor = QTextCursor(doc)
+        cursor.select(QTextCursor.Document)
+        cursor.setCharFormat(QTextCharFormat())
+
+        # фіолетове підсвічення
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor("#d9b3ff"))
+
         cursor = self.right_text_edit.textCursor()
         cursor.setPosition(pos)
         cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, len(name))
-
-        fmt = QTextCharFormat()
-        fmt.setBackground(QColor("#e5ccff"))  # м'який фіолетовий
         cursor.mergeCharFormat(fmt)
 
         self.right_text_edit.setTextCursor(cursor)
@@ -611,8 +779,8 @@ class MatchAnalysisDialog(QDialog):
         if pos == -1:
             return
 
-        # сначала вертаємо жёлтую подсветку по всему тексту
-        self.highlight_all_matches()
+        # для ПІБ повертаємо жовті підсвічення
+        self.highlight_all_pib_matches()
 
         cursor = self.right_text_edit.textCursor()
         cursor.setPosition(pos)
@@ -620,9 +788,9 @@ class MatchAnalysisDialog(QDialog):
             QTextCursor.Right, QTextCursor.KeepAnchor, len(name)
         )
 
-        fmt_green = QTextCharFormat()
-        fmt_green.setBackground(Qt.lightGray)
-        cursor.mergeCharFormat(fmt_green)
+        fmt_sel = QTextCharFormat()
+        fmt_sel.setBackground(Qt.lightGray)
+        cursor.mergeCharFormat(fmt_sel)
 
         self.right_text_edit.setTextCursor(cursor)
         self.right_text_edit.ensureCursorVisible()
@@ -642,11 +810,16 @@ class MatchAnalysisDialog(QDialog):
                     return
 
     # ============================================================
-    # ЕКСПОРТ УНІКАЛЬНИХ
+    #                       ЕКСПОРТ УНІКАЛЬНИХ
     # ============================================================
 
-    def export_unique_rows(self):
-        if self.unique_rows is None or self.unique_rows.empty:
+    def export_unique_rows(self, mode: str):
+        if mode == "pib":
+            unique_rows = self.pib_unique_rows
+        else:
+            unique_rows = self.ors_unique_rows
+
+        if unique_rows is None or unique_rows.empty:
             QMessageBox.information(self, "Немає даних", "Немає унікальних рядків.")
             return
 
@@ -661,9 +834,9 @@ class MatchAnalysisDialog(QDialog):
 
         try:
             if path.endswith(".xlsx") or "Excel" in selected:
-                self.unique_rows.to_excel(path, index=False)
+                unique_rows.to_excel(path, index=False)
             else:
-                self.unique_rows.to_csv(path, index=False)
+                unique_rows.to_csv(path, index=False)
 
             QMessageBox.information(self, "OK", f"Файл збережено:\n{path}")
 
@@ -706,7 +879,9 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(5, 5, 5, 5)
 
+        # ----------------------------------------------------
         # Верхня панель
+        # ----------------------------------------------------
         top = QHBoxLayout()
 
         self.btn_load = QPushButton("📂 Відкрити")
@@ -723,7 +898,6 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(False)
         top.addWidget(self.btn_export)
 
-        # новая кнопка анализа совпадений
         self.btn_match = QPushButton("🔍 Збіги / аналіз")
         self.btn_match.clicked.connect(self.open_match_dialog)
         self.btn_match.setEnabled(False)
@@ -738,7 +912,6 @@ class MainWindow(QMainWindow):
         self.ed_search.setEnabled(False)
         top.addWidget(self.ed_search, stretch=2)
 
-        # Вкладки режимів справа
         self.tab_mode = QTabWidget()
         self.tab_mode.addTab(QWidget(), "Основні")
         self.tab_mode.addTab(QWidget(), "Архів")
@@ -750,14 +923,15 @@ class MainWindow(QMainWindow):
 
         root.addLayout(top)
 
-        # Центральна частина
-        main = QHBoxLayout()
+        # ----------------------------------------------------
+        # Центральна частина — QSplitter
+        # ----------------------------------------------------
+        main_splitter = QSplitter(Qt.Horizontal)
 
         # Ліва панель
         left = QVBoxLayout()
         left.setAlignment(Qt.AlignTop)
 
-        # Фільтр по прокуратурі
         lbl_p = QLabel("Фільтр по прокуратурі:")
         lbl_p.setStyleSheet("font-weight: bold;")
         left.addWidget(lbl_p)
@@ -770,7 +944,6 @@ class MainWindow(QMainWindow):
 
         left.addSpacing(15)
 
-        # Фільтр по стовпцю
         lbl_c = QLabel("Фільтр по стовпцю:")
         lbl_c.setStyleSheet("font-weight: bold;")
         left.addWidget(lbl_c)
@@ -790,13 +963,11 @@ class MainWindow(QMainWindow):
         self.ed_value.setEnabled(False)
         left.addWidget(self.ed_value)
 
-        # Випадаючий список можливих значень
         self.cb_value_choices = QComboBox()
         self.cb_value_choices.setVisible(False)
         self.cb_value_choices.currentIndexChanged.connect(self.on_value_choice_selected)
         left.addWidget(self.cb_value_choices)
 
-        # Поля дат для гнучкого діапазону
         self.ed_date_from = QLineEdit()
         self.ed_date_from.setVisible(False)
         left.addWidget(self.ed_date_from)
@@ -828,7 +999,6 @@ class MainWindow(QMainWindow):
         self.btn_clear_conditions.setEnabled(False)
         left.addWidget(self.btn_clear_conditions)
 
-        # Кнопка "Показати строки зі строком, що спливає"
         self.btn_show_expiring = QPushButton("Показати строки зі строком, що спливає")
         self.btn_show_expiring.setEnabled(False)
         self.btn_show_expiring.setCheckable(True)
@@ -837,7 +1007,6 @@ class MainWindow(QMainWindow):
 
         left.addSpacing(10)
 
-        # Кнопка "Перевірити дублікати"
         self.btn_check_duplicates = QPushButton("Перевірити дублікати (ПІБ)")
         self.btn_check_duplicates.setEnabled(False)
         self.btn_check_duplicates.clicked.connect(self.on_check_duplicates_clicked)
@@ -845,7 +1014,6 @@ class MainWindow(QMainWindow):
 
         left.addSpacing(10)
 
-        # Операції з рядками
         lbl_ops = QLabel("Операції з рядками (за виділенням):")
         lbl_ops.setStyleSheet("font-weight: bold;")
         left.addWidget(lbl_ops)
@@ -874,53 +1042,44 @@ class MainWindow(QMainWindow):
             lambda _: self.remove_selected_condition()
         )
 
+        left_widget = QWidget()
+        left_widget.setLayout(left)
+        left_widget.setMinimumWidth(260)
+        left_widget.setMaximumWidth(380)
+
         # Таблиця справа
         self.table_view = QTableView()
         self.table_view.setAlternatingRowColors(True)
         self.table_view.horizontalHeader().setStretchLastSection(True)
 
-        self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table_view.setEditTriggers(
-            QAbstractItemView.SelectedClicked
-            | QAbstractItemView.DoubleClicked
-            | QAbstractItemView.EditKeyPressed
-        )
+        main_splitter.addWidget(left_widget)
+        main_splitter.addWidget(self.table_view)
 
-        main.addLayout(left, 1)
-        main.addWidget(self.table_view, 3)
+        main_splitter.setStretchFactor(0, 0)
+        main_splitter.setStretchFactor(1, 1)
 
-        root.addLayout(main)
+        root.addWidget(main_splitter)
 
-        # добавили основной layout main выше
-        root.addLayout(main)
-
-        # ---- Нижня панель: кнопка легенди + лого ----
+        # ----------------------------------------------------
+        # Нижня панель
+        # ----------------------------------------------------
         bottom_bar = QHBoxLayout()
         bottom_bar.setContentsMargins(4, 2, 4, 2)
         bottom_bar.setSpacing(6)
 
-        # Кнопка для открытия легенды кольорів
         self.btn_show_legend = QPushButton("Легенда кольорів")
         self.btn_show_legend.setFlat(True)
         self.btn_show_legend.setCursor(Qt.PointingHandCursor)
         self.btn_show_legend.setStyleSheet(
-            "QPushButton { "
-            "border: none; "
-            "color: #555; "
-            "font-size: 11px; "
-            "text-decoration: underline; "
-            "padding: 0 4px; "
-            "} "
+            "QPushButton { border: none; color: #555; font-size: 11px; "
+            "text-decoration: underline; padding: 0 4px; } "
             "QPushButton:hover { color: #111; }"
         )
         self.btn_show_legend.clicked.connect(self.show_colors_legend)
         bottom_bar.addWidget(self.btn_show_legend)
 
-        # пустое пространство по центру
         bottom_bar.addStretch()
 
-        # Логотип (уменьшенный)
         logo_label = QLabel()
         logo_path = resource_path("assets/national.png")
         if logo_path.exists():
@@ -930,7 +1089,6 @@ class MainWindow(QMainWindow):
                 logo_label.setPixmap(pm)
         bottom_bar.addWidget(logo_label)
 
-        # Подпись ©
         copyright_label = QLabel("© Cybersheeld")
         copyright_label.setStyleSheet("color: #555; font-size: 10px;")
         bottom_bar.addWidget(copyright_label)
