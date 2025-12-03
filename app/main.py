@@ -155,8 +155,8 @@ class MatchAnalysisDialog(QDialog):
     """
     Аналіз збігів між лівою таблицею та зовнішнім документом.
     Режими:
-      - ПІБ (за прізвищем/ПІБ)
-      - ОРС (за номером ОРС з 8-ї колонки)
+      - ПІБ (за прізвищем/ПІБ, у т.ч. коли ПІБ у трьох окремих колонках)
+      - ОРС (за номером ОРС / ОРД / РД, витягнутим з рядка)
     """
 
     def __init__(self, parent=None, current_df: pd.DataFrame | None = None):
@@ -395,6 +395,107 @@ class MatchAnalysisDialog(QDialog):
             QMessageBox.critical(self, "Помилка", str(e))
 
     # ============================================================
+    # ДОПОМІЖНІ МЕТОДИ ДЛЯ УНІФІКАЦІЇ ПІБ ТА № ОРС
+    # ============================================================
+
+    def _get_pib_series(self) -> pd.Series | None:
+        """
+        Повертає серію з ПІБ для лівої таблиці.
+
+        1) Якщо є колонка з 'ПІБ' у назві – використовуємо її як є.
+        2) Якщо її немає – пробуємо зібрати ПІБ із колонок
+           'Прізвище' / 'Ім’я' / 'По батькові' (або схожих).
+        """
+        if self.left_df is None:
+            return None
+
+        df = self.left_df
+
+        # 1) Колонка з ПІБ цілком
+        pib_col = next((c for c in df.columns if "ПІБ" in str(c)), None)
+        if pib_col is not None:
+            return df[pib_col].astype(str)
+
+        # 2) Пробуємо знайти окремі колонки для ПІБ
+        def find_col(substrings: list[str]) -> str | None:
+            for col in df.columns:
+                name = str(col)
+                if any(sub in name for sub in substrings):
+                    return col
+            return None
+
+        col_last = find_col(["Прізвище", "Прiзвище", "Прізвище (укр)"])
+        col_first = find_col(["Ім'", "Ім’я", "Імя", "Имя"])
+        col_patron = find_col(["По батьков", "По-батьков", "По батькові", "По-батькові"])
+
+        if not any([col_last, col_first, col_patron]):
+            # Взагалі немає колонок з ПІБ
+            return None
+
+        parts: list[pd.Series] = []
+        if col_last:
+            parts.append(df[col_last].astype(str).str.strip())
+        if col_first:
+            parts.append(df[col_first].astype(str).str.strip())
+        if col_patron:
+            parts.append(df[col_patron].astype(str).str.strip())
+
+        # Склеюємо знайдені частини через пробіл
+        result = parts[0]
+        for ser in parts[1:]:
+            result = result + " " + ser
+
+        result = result.str.replace(r"\s+", " ", regex=True).str.strip()
+        return result
+
+    def _get_ors_series(self) -> pd.Series | None:
+        """
+        Повертає серію з № ОРС (або ОРД/РД) для лівої таблиці.
+
+        Логіка:
+        1) Якщо є явна колонка з назвою типу '№ ОРС', '№ОРС', 'ОРД. РД №' – беремо її.
+        2) Якщо ні – склеюємо весь рядок у один текст і шукаємо перший номер
+           з 5–10 цифр (регулярка).
+        """
+        if self.left_df is None:
+            return None
+
+        df = self.left_df
+
+        def find_ors_col() -> str | None:
+            candidates = [
+                "№ ОРС",
+                "№ОРС",
+                "№ОРД",
+                "ОРД. РД",
+                "ОРД РД",
+                "ОРД/РД",
+                "ОРС №",
+            ]
+            for col in df.columns:
+                name = str(col)
+                if any(sub in name for sub in candidates):
+                    return col
+            return None
+
+        ors_col = find_ors_col()
+        if ors_col:
+            base = df[ors_col].astype(str)
+        else:
+            # Склеюємо весь рядок
+            base = df.astype(str).agg(" ".join, axis=1)
+
+        # Витягуємо перший "пристойний" номер (5–10 цифр поспіль)
+        pattern = r"(\d{5,10})"
+        extracted = base.str.extract(pattern, expand=False)
+        extracted = extracted.fillna("")
+
+        if extracted.eq("").all():
+            return None
+
+        return extracted
+
+    # ============================================================
     #                 ЗАВАНТАЖЕННЯ ДОКУМЕНТА СПРАВА
     # ============================================================
 
@@ -520,25 +621,24 @@ class MatchAnalysisDialog(QDialog):
     # --- внутрішній аналіз по ПІБ ---
 
     def _find_pib_matches(self):
-        pib_col = next((c for c in self.left_df.columns if "ПІБ" in str(c)), None)
-        if pib_col is None:
-            # без ПІБ просто очищаємо вкладку
-            self.pib_matches = []
-            self.pib_unique_rows = None
-            self.list_matches_pib.clear()
-            self.list_unique_pib.clear()
-            self.btn_export_unique_pib.setEnabled(False)
-            return
+        pib_series = self._get_pib_series()
 
-        series = self.left_df[pib_col].astype(str)
-        text_lower = self.right_text.lower()
-
-        self.pib_matches.clear()
+        # очищаємо вкладку ПІБ
+        self.pib_matches = []
+        self.pib_unique_rows = None
         self.list_matches_pib.clear()
         self.list_unique_pib.clear()
+        self.btn_export_unique_pib.setEnabled(False)
 
-        for idx, val in series.items():
-            name = val.split(",")[0].strip()
+        if pib_series is None:
+            # немає інформації про ПІБ у лівій таблиці
+            return
+
+        text_lower = self.right_text.lower()
+        matched_idx: set[int] = set()
+
+        for idx, val in pib_series.items():
+            name = str(val).split(",")[0].strip()
             if not name:
                 continue
             name_lower = name.lower()
@@ -546,11 +646,13 @@ class MatchAnalysisDialog(QDialog):
                 count = text_lower.count(name_lower)
                 self.pib_matches.append((idx, name))
                 self.list_matches_pib.addItem(f"{idx}: {name} ({count})")
+                matched_idx.add(idx)
 
-        matched_idx = {i for i, _ in self.pib_matches}
+        # унікальні по ПІБ
         self.pib_unique_rows = self.left_df[~self.left_df.index.isin(matched_idx)].copy()
-        for idx, row in self.pib_unique_rows.iterrows():
-            self.list_unique_pib.addItem(f"{idx}: {row[pib_col]}")
+        for idx, val in pib_series.items():
+            if idx not in matched_idx:
+                self.list_unique_pib.addItem(f"{idx}: {val}")
 
         self.btn_export_unique_pib.setEnabled(
             self.pib_unique_rows is not None and not self.pib_unique_rows.empty
@@ -559,36 +661,24 @@ class MatchAnalysisDialog(QDialog):
     # --- внутрішній аналіз по ОРС ---
 
     def _find_ors_matches(self):
-        import re
+        ors_series = self._get_ors_series()
 
-        # шукаємо колонку з ОРС
-        ors_col = next(
-            (c for c in self.left_df.columns
-             if "№ ОРС" in str(c) or "№ОРС" in str(c) or "ОРС" in str(c)),
-            None
-        )
-        if ors_col is None:
-            # немає колонки ОРС — чистимо вкладку
-            self.ors_matches = []
-            self.ors_unique_rows = None
-            self.list_matches_ors.clear()
-            self.list_unique_ors.clear()
-            self.btn_export_unique_ors.setEnabled(False)
-            return
-
-        series = self.left_df[ors_col].astype(str)
-        text_lower = self.right_text.lower()
-
-        self.ors_matches.clear()
+        # очищаємо вкладку ОРС
+        self.ors_matches = []
+        self.ors_unique_rows = None
         self.list_matches_ors.clear()
         self.list_unique_ors.clear()
+        self.btn_export_unique_ors.setEnabled(False)
 
-        for idx, val in series.items():
-            # беремо першу послідовність цифр як номер ОРС
-            m = re.search(r"\d+", val)
-            if not m:
-                continue
-            num = m.group(0).strip()
+        if ors_series is None:
+            # взагалі не вдалось витягнути номери
+            return
+
+        text_lower = self.right_text.lower()
+        matched_idx: set[int] = set()
+
+        for idx, raw_num in ors_series.items():
+            num = str(raw_num).strip()
             if not num:
                 continue
 
@@ -597,12 +687,12 @@ class MatchAnalysisDialog(QDialog):
                 count = text_lower.count(num_lower)
                 self.ors_matches.append((idx, num))
                 self.list_matches_ors.addItem(f"{idx}: {num} ({count})")
+                matched_idx.add(idx)
 
-        matched_idx = {i for i, _ in self.ors_matches}
         self.ors_unique_rows = self.left_df[~self.left_df.index.isin(matched_idx)].copy()
-        for idx, row in self.ors_unique_rows.iterrows():
-            # показуємо весь текст з колонки ОРС для наочності
-            self.list_unique_ors.addItem(f"{idx}: {row[ors_col]}")
+        for idx, raw_num in ors_series.items():
+            if idx not in matched_idx:
+                self.list_unique_ors.addItem(f"{idx}: {raw_num}")
 
         self.btn_export_unique_ors.setEnabled(
             self.ors_unique_rows is not None and not self.ors_unique_rows.empty
