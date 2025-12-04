@@ -5,32 +5,60 @@ from docx import Document
 
 def _load_from_docx(path: str) -> pd.DataFrame:
     """
-    Загрузить первую осмысленную таблицу из .docx в DataFrame.
-    Ожидается прямоугольная таблица (как твой реєстр).
+    Загрузить все однотипные таблицы из .docx в один DataFrame.
+
+    Логика:
+    - Берём первую «осмислену» таблицу как эталонную (там заголовки).
+    - По всем остальным таблицам:
+        * проверяем совпадение количества колонок;
+        * пропускаем их первую строку (свою шапку);
+        * добавляем строки в общий список.
+    - Полностью пустые строки отбрасываем.
     """
     doc = Document(path)
 
-    table = None
-    for t in doc.tables:
-        if len(t.rows) >= 2:
-            table = t
-            break
+    header: list[str] | None = None
+    rows: list[dict[str, str]] = []
 
-    if table is None:
-        raise ValueError("У документі Word не знайдено підходящої таблиці.")
+    for table in doc.tables:
+        # Таблица должна хотя бы иметь шапку + одну строку данных
+        if len(table.rows) < 2:
+            continue
 
-    headers = [cell.text.strip() for cell in table.rows[0].cells]
-    rows = []
+        # Шапка текущей таблицы
+        current_header = [cell.text.strip() for cell in table.rows[0].cells]
 
-    for row in table.rows[1:]:
-        values = [cell.text.strip() for cell in row.cells]
+        # Если шапка полностью пустая — пропускаем таблицу
+        if not any(current_header):
+            continue
 
-        if len(values) < len(headers):
-            values += [""] * (len(headers) - len(values))
-        elif len(values) > len(headers):
-            values = values[: len(headers)]
+        # Первая «нормальная» таблица — задаём эталонный header
+        if header is None:
+            header = current_header
+        else:
+            # Если количество колонок не совпадает — считаем,
+            # что это другая структура, такую таблицу пропускаем.
+            if len(current_header) != len(header):
+                continue
 
-        rows.append(dict(zip(headers, values)))
+        # Обрабатываем строки данных (пропускаем собственный header таблицы)
+        for row in table.rows[1:]:
+            values = [cell.text.strip() for cell in row.cells]
+
+            # Выравниваем длину под header
+            if len(values) < len(header):
+                values += [""] * (len(header) - len(values))
+            elif len(values) > len(header):
+                values = values[: len(header)]
+
+            # Если строка полностью пустая — пропускаем
+            if not any(values):
+                continue
+
+            rows.append(dict(zip(header, values)))
+
+    if header is None:
+        raise ValueError("У документі Word не знайдено придатних таблиць.")
 
     df = pd.DataFrame(rows)
     return df
@@ -41,7 +69,7 @@ def load_test_df(path: str = "registry_test.csv") -> pd.DataFrame:
     Универсальная загрузка:
     - .csv
     - .xlsx / .xls
-    - .docx (таблица Word)
+    - .docx (одна или несколько однотипных таблиц Word в один DataFrame)
     """
     ext = os.path.splitext(path)[1].lower()
 
@@ -52,9 +80,10 @@ def load_test_df(path: str = "registry_test.csv") -> pd.DataFrame:
     elif ext == ".docx":
         df = _load_from_docx(path)
     else:
+        # по умолчанию пытаемся как csv
         df = pd.read_csv(path)
 
-    # Примерный набор дат (под твой реєстр, можно расширить по факту)
+    # Примерный набор колонок-дат (под твой реєстр, можно дополнять)
     date_cols = [
         "Дата_реєстрації",
         "Дата_нар",
@@ -72,7 +101,7 @@ def load_test_df(path: str = "registry_test.csv") -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
 
-    # Булеві (Так/Ні) – можно расширить список
+    # Булеві (Так/Ні) – можна доповнювати список при потребі
     bool_map = {
         "Так": True,
         "так": True,

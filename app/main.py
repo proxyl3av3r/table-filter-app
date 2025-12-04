@@ -1314,11 +1314,23 @@ class MainWindow(QMainWindow):
 
         # Прокуратури
         self.cb_prosecutor.setEnabled(True)
+
+        # чтобы при перезаполнении не срабатывал currentIndexChanged
+        self.cb_prosecutor.blockSignals(True)
         self.cb_prosecutor.clear()
         self.cb_prosecutor.addItem("Усі прокуратури")
         if "Прокуратура" in df.columns:
             for p in sorted(df["Прокуратура"].dropna().unique()):
                 self.cb_prosecutor.addItem(str(p))
+
+        # ЯВНО сбрасываем выбор на "Усі прокуратури"
+        self.cb_prosecutor.setCurrentIndex(0)
+        self.cb_prosecutor.blockSignals(False)
+        
+        # завжди скидаємо фільтр на "Усі прокуратури"
+        self.cb_prosecutor.blockSignals(True)
+        self.cb_prosecutor.setCurrentIndex(0)
+        self.cb_prosecutor.blockSignals(False)
 
         # Стовпці (без службових)
         self.cb_column.setEnabled(True)
