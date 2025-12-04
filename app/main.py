@@ -1202,7 +1202,7 @@ class MainWindow(QMainWindow):
                 logo_label.setPixmap(pm)
         bottom_bar.addWidget(logo_label)
 
-        copyright_label = QLabel("© Cybersheeld")
+        copyright_label = QLabel("© Відділ 09/6")
         copyright_label.setStyleSheet("color: #555; font-size: 10px;")
         bottom_bar.addWidget(copyright_label)
 
@@ -1410,17 +1410,17 @@ class MainWindow(QMainWindow):
 
         5-я колонка ("Запобіжний захід ..."):
             • Берём первую дату (ВІД) -> +6 месяцев = дата закінчення.
+            • Учитываем только те сроки, дата закінчення яких >= 01.09.2025.
             • Якщо до закінчення строку <= 10 діб -> жовта КЛІТИНКА (тільки 5-та колонка).
             • Якщо строк вже минув -> ЧЕРВОНИЙ ВЕСЬ РЯДОК.
 
-        7–8 колонка ("Підстава, дата зупинення" + "№ ОРС, дата заведення"):
+        7–8 колонка ("Дата та вихідний № доручення" + "№ ОРС, дата заведення"):
             • Якщо у 7-й є дата, але у 8-й НЕМає:
                 - 0..20 діб від дати у 7-й -> жовті клітинки в 7-й та 8-й.
                 - >20 діб -> червоні клітинки в 7-й та 8-й.
-
             • Якщо у 7-й немає дати -> рядок не бере участі у цій перевірці.
         """
-        # сбрасываем все маркеры
+        # сбрасываем всё
         self.expired_indices = set()
         self.expiring_by5_indices = set()
         self.ors_warning_indices = set()
@@ -1433,28 +1433,37 @@ class MainWindow(QMainWindow):
 
         df = self.df_original
         today = pd.Timestamp.today().normalize()
+        cutoff_5 = pd.Timestamp(2025, 9, 1)   # прострочки враховуємо тільки ПІСЛЯ 09.2025
 
-        # ---- визначаємо потрібні колонки по назві ----
-        col5 = next((c for c in df.columns if "Запобіжний захід" in str(c)), None)
-        col7 = next((c for c in df.columns if "Підстава, дата зупинення" in str(c)), None)
-        col8 = next((c for c in df.columns if "№ ОРС" in str(c)), None)
+        # ---- шукаємо потрібні колонки ----
+        self.col5_name = next((c for c in df.columns if "Запобіжний захід" in str(c)), None)
 
-        # збережемо, якщо раптом ще десь стане в нагоді (і для моделі)
-        self.col5_name = col5
-        self.col7_name = col7
-        self.col8_name = col8
+        # БАЗОВА дата для ОРС – саме доручення (7-а колонка)
+        self.col7_name = next(
+            (
+                c
+                for c in df.columns
+                if "Дата та вихідний № доручення" in str(c)
+                or ("доручення" in str(c) and "вихідний" in str(c))
+            ),
+            None,
+        )
+
+        self.col8_name = next(
+            (c for c in df.columns if "№ ОРС" in str(c)),
+            None,
+        )
 
         # ------------------------------------------------
         # 1) 5-та колонка — строк запобіжного заходу
         # ------------------------------------------------
-        if col5:
-            ser5 = df[col5].astype(str)
+        if self.col5_name:
+            ser5 = df[self.col5_name].astype(str)
 
-            # берем только ПЕРВУЮ дату (ВІД)
+            # берем первую дату (ВІД)
             first_dates_str = ser5.str.extract(r"(\d{2}\.\d{2}\.\d{4})")[0]
             dates5 = pd.to_datetime(first_dates_str, format="%d.%m.%Y", errors="coerce")
 
-            # дата закінчення = +6 місяців
             expiry_dates = dates5 + pd.DateOffset(months=6)
 
             for idx in df.index:
@@ -1462,21 +1471,25 @@ class MainWindow(QMainWindow):
                 if pd.isna(d_exp):
                     continue
 
+                # игнорируем все, что заканчивается до 01.09.2025
+                if d_exp < cutoff_5:
+                    continue
+
                 days_left = (d_exp - today).days
 
-                # строк вже минув -> червоний весь рядок
                 if days_left < 0:
+                    # строк уже прошёл → красный ряд
                     self.expired_indices.add(idx)
-                # ≤10 діб до прострочки -> жовта клітинка в 5-й (індекс рядка, колонку знає модель)
                 elif 0 <= days_left <= 10:
+                    # 10 діб до прострочки → жёлтая клетка в 5-й
                     self.expiring_by5_indices.add(idx)
 
         # ------------------------------------------------
         # 2) 7–8 колонки — "не заведено ОРС"
         # ------------------------------------------------
-        if col7 and col8:
-            ser7 = df[col7].astype(str)
-            ser8 = df[col8].astype(str)
+        if self.col7_name and self.col8_name:
+            ser7 = df[self.col7_name].astype(str)
+            ser8 = df[self.col8_name].astype(str)
 
             d7 = ser7.str.extract(r"(\d{2}\.\d{2}\.\d{4})")[0]
             d7 = pd.to_datetime(d7, format="%d.%m.%Y", errors="coerce")
@@ -1488,25 +1501,27 @@ class MainWindow(QMainWindow):
                 base_date = d7.loc[idx]
                 ors_date = d8.loc[idx]
 
-                # якщо в 7-й немає дати — не перевіряємо
+                # если в 7-й нет даты — строка не участвует
                 if pd.isna(base_date):
                     continue
 
-                # якщо в 8-й вже є дата — усе добре
+                # если в 8-й уже есть дата — всё ок
                 if not pd.isna(ors_date):
                     continue
 
                 days_passed = (today - base_date).days
 
                 if 0 <= days_passed <= 20:
+                    # жёлтые 7 и 8
                     self.ors_warning_indices.add(idx)
                     self.ors_warning_rows.add(idx)
                 elif days_passed > 20:
+                    # красные 7 и 8
                     self.ors_overdue_indices.add(idx)
                     self.ors_overdue_rows.add(idx)
 
         # ------------------------------------------------
-        # 3) Попап з коротким резюме (якщо є що показати)
+        # 3) Попап з коротким резюме
         # ------------------------------------------------
         if show_popup:
             parts = []
@@ -1514,8 +1529,7 @@ class MainWindow(QMainWindow):
                 parts.append(f"Прострочені строки (5-та колонка): {len(self.expired_indices)}")
             if self.expiring_by5_indices:
                 parts.append(
-                    f"Строки, що спливають (≤10 діб, 5-та колонка): "
-                    f"{len(self.expiring_by5_indices)}"
+                    f"Строки, що спливають (≤10 діб, 5-та колонка): {len(self.expiring_by5_indices)}"
                 )
             if self.ors_warning_rows:
                 parts.append(f"Не заведено ОРС (до 20 діб): {len(self.ors_warning_rows)}")
@@ -1828,9 +1842,9 @@ class MainWindow(QMainWindow):
             elif self.view_mode == "expired":
                 df = df[(df["is_deleted"] == False) & (df.index.isin(self.expired_indices))]
             elif self.view_mode == "ors_warning":
-                df = df[(df["is_deleted"] == False) & (df.index.isin(self.ors_warning_indices))]
+                df = df[(df["is_deleted"] == False) & (df.index.isin(self.ors_warning_rows))]
             elif self.view_mode == "ors_overdue":
-                df = df[(df["is_deleted"] == False) & (df.index.isin(self.ors_overdue_indices))]
+                df = df[(df["is_deleted"] == False) & (df.index.isin(self.ors_overdue_rows))]
 
         self.df_current = df
 
