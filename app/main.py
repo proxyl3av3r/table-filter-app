@@ -949,11 +949,35 @@ class MainWindow(QMainWindow):
 
         self.conditions: list[FilterCondition] = []
         self.global_search_text: str = ""
-        self.expiring_indices: Set[Any] = set()   # червоний (спливає)
-        self.expired_indices: Set[Any] = set()    # синій (прострочені)
+
+        # ----- маркери станів рядків / клітинок -----
+        # повністю червоні рядки (прострочений строк за 5-ю колонкою)
+        self.expired_indices: Set[Any] = set()
+
+        # жовта КЛІТИНКА в 5-й колонці (до прострочення ≤ 10 діб)
+        self.expiring_by5_indices: Set[Any] = set()
+
+        # попередження по ОРС (жовті клітинки в 7–8 колонках, до 20 діб)
+        self.ors_warning_indices: Set[Any] = set()
+
+        # прострочені по ОРС (червоні клітинки в 7–8 колонках, >20 діб)
+        self.ors_overdue_indices: Set[Any] = set()
+
+        # дублікати ПІБ (сині рядки)
         self.duplicate_indices: Set[Any] = set()
-        self.show_only_expiring: bool = False
-        self.view_mode: str = "main"  # main / archive / deleted / expired
+
+        # для пояснюючих попапів — зберігаємо ще окремо ряди по ОРС
+        self.ors_warning_rows: Set[Any] = set()
+        self.ors_overdue_rows: Set[Any] = set()
+
+        # імена ключових колонок (передаємо в модель для точкової підсвітки)
+        self.col5_name: str | None = None
+        self.col7_name: str | None = None
+        self.col8_name: str | None = None
+
+        # поточний режим перегляду:
+        # main / archive / deleted / expired / ors_warning / ors_overdue
+        self.view_mode: str = "main"
 
         self.current_file_path: str | None = None
 
@@ -1002,11 +1026,14 @@ class MainWindow(QMainWindow):
         self.ed_search.setEnabled(False)
         top.addWidget(self.ed_search, stretch=2)
 
+        # Вкладки режимів перегляду
         self.tab_mode = QTabWidget()
         self.tab_mode.addTab(QWidget(), "Основні")
         self.tab_mode.addTab(QWidget(), "Архів")
         self.tab_mode.addTab(QWidget(), "Видалені")
-        self.tab_mode.addTab(QWidget(), "Прострочені")
+        self.tab_mode.addTab(QWidget(), "Прострочені (строк)")
+        self.tab_mode.addTab(QWidget(), "Не заведено ОРС (20 діб)")
+        self.tab_mode.addTab(QWidget(), "Не заведено ОРС (прострочено)")
         self.tab_mode.currentChanged.connect(self.on_tab_changed)
         self.tab_mode.setTabPosition(QTabWidget.North)
         top.addWidget(self.tab_mode)
@@ -1089,12 +1116,6 @@ class MainWindow(QMainWindow):
         self.btn_clear_conditions.setEnabled(False)
         left.addWidget(self.btn_clear_conditions)
 
-        self.btn_show_expiring = QPushButton("Показати строки зі строком, що спливає")
-        self.btn_show_expiring.setEnabled(False)
-        self.btn_show_expiring.setCheckable(True)
-        self.btn_show_expiring.toggled.connect(self.on_toggle_show_expiring)
-        left.addWidget(self.btn_show_expiring)
-
         left.addSpacing(10)
 
         self.btn_check_duplicates = QPushButton("Перевірити дублікати (ПІБ)")
@@ -1141,6 +1162,8 @@ class MainWindow(QMainWindow):
         self.table_view = QTableView()
         self.table_view.setAlternatingRowColors(True)
         self.table_view.horizontalHeader().setStretchLastSection(True)
+        self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
         main_splitter.addWidget(left_widget)
         main_splitter.addWidget(self.table_view)
@@ -1151,7 +1174,7 @@ class MainWindow(QMainWindow):
         root.addWidget(main_splitter)
 
         # ----------------------------------------------------
-        # Нижня панель
+        # Нижня панель (легенда + лого)
         # ----------------------------------------------------
         bottom_bar = QHBoxLayout()
         bottom_bar.setContentsMargins(4, 2, 4, 2)
@@ -1198,10 +1221,12 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Легенда кольорів",
-            "Строк спливає – червоний фон\n"
-            "Прострочено – синій фон\n"
-            "Дублікат ПІБ – жовтий фон\n"
-            "Архів – зелений фон\n"
+            "Прострочений строк запобіжного заходу (6 міс. від ВІД) – червоний весь рядок\n"
+            "Строк запобіжного заходу спливає (≤10 діб до 6 міс.) – жовта клітинка у 5-й колонці\n"
+            "Не заведено ОРС (до 20 діб від дати у 7-й колонці) – жовті клітинки у 7-й та 8-й колонках\n"
+            "Не заведено ОРС (прострочено >20 діб) – червоні клітинки у 7-й та 8-й колонках\n"
+            "Дублікат ПІБ – синій фон всього рядка\n"
+            "Архів – зелений фон всього рядка\n"
         )
 
     # --------------------------------------------------------
@@ -1275,9 +1300,14 @@ class MainWindow(QMainWindow):
         model = PandasTableModel(
             self.df_current,
             edit_callback=self.on_cell_edited,
-            expiring_indices=self.expiring_indices,
+            expiring_by5_indices=self.expiring_by5_indices,
             expired_indices=self.expired_indices,
             duplicate_indices=self.duplicate_indices,
+            ors_warning_indices=self.ors_warning_indices,
+            ors_overdue_indices=self.ors_overdue_indices,
+            col5_name=self.col5_name,
+            col7_name=self.col7_name,
+            col8_name=self.col8_name,
         )
         self.table_view.setModel(model)
         self.hide_service_columns()
@@ -1307,22 +1337,22 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(True)
         self.btn_match.setEnabled(True)
         self.ed_search.setEnabled(True)
-        self.btn_show_expiring.setEnabled(bool(self.expiring_indices))
         self.btn_check_duplicates.setEnabled(True)
 
+        # сбрасываем условия и поисковые поля
         self.conditions.clear()
         self.list_conditions.clear()
         self.global_search_text = ""
         self.ed_search.clear()
-        self.show_only_expiring = False
-        self.btn_show_expiring.setChecked(False)
+
+        # режим просмотра — главное окно
         self.view_mode = "main"
         self.tab_mode.setCurrentIndex(0)
         self.update_action_buttons_state()
 
         self.on_column_changed(self.cb_column.currentIndex())
 
-        # зберігаємо стан
+        # сохраняем состояние
         self._save_state()
 
     # --------------------------------------------------------
@@ -1376,73 +1406,124 @@ class MainWindow(QMainWindow):
 
     def recalc_expiring_and_expired(self, show_popup: bool = True):
         """
-        Позначає рядки, де:
-        - у колонці із запобіжним заходом дата "до" спливає ≤10 днів (expiring);
-        - у тій же колонці "до" вже минула (expired);
-        - + логіка по № ОРС (20 днів) лише для expiring.
+        Новая логика:
+
+        5-я колонка ("Запобіжний захід ..."):
+            • Берём первую дату (ВІД) -> +6 месяцев = дата закінчення.
+            • Якщо до закінчення строку <= 10 діб -> жовта КЛІТИНКА (тільки 5-та колонка).
+            • Якщо строк вже минув -> ЧЕРВОНИЙ ВЕСЬ РЯДОК.
+
+        7–8 колонка ("Підстава, дата зупинення" + "№ ОРС, дата заведення"):
+            • Якщо у 7-й є дата, але у 8-й НЕМає:
+                - 0..20 діб від дати у 7-й -> жовті клітинки в 7-й та 8-й.
+                - >20 діб -> червоні клітинки в 7-й та 8-й.
+
+            • Якщо у 7-й немає дати -> рядок не бере участі у цій перевірці.
         """
-        self.expiring_indices = set()
+        # сбрасываем все маркеры
         self.expired_indices = set()
+        self.expiring_by5_indices = set()
+        self.ors_warning_indices = set()
+        self.ors_overdue_indices = set()
+        self.ors_warning_rows = set()
+        self.ors_overdue_rows = set()
+
         if self.df_original is None:
             return
 
         df = self.df_original
         today = pd.Timestamp.today().normalize()
 
-        # ----- Колонка 5: Запобіжний захід / ухвала про дозвіл ... -----
-        col5 = next(
-            (c for c in df.columns if "Запобіжн" in str(c) or "ухвала про дозвіл" in str(c)),
-            None,
-        )
+        # ---- визначаємо потрібні колонки по назві ----
+        col5 = next((c for c in df.columns if "Запобіжний захід" in str(c)), None)
+        col7 = next((c for c in df.columns if "Підстава, дата зупинення" in str(c)), None)
+        col8 = next((c for c in df.columns if "№ ОРС" in str(c)), None)
+
+        # збережемо, якщо раптом ще десь стане в нагоді (і для моделі)
+        self.col5_name = col5
+        self.col7_name = col7
+        self.col8_name = col8
+
+        # ------------------------------------------------
+        # 1) 5-та колонка — строк запобіжного заходу
+        # ------------------------------------------------
         if col5:
             ser5 = df[col5].astype(str)
-            # Витягуємо всі дати, беремо останню як "до"
-            matches5 = ser5.str.extractall(r"(\d{2}\.\d{2}\.\d{4})")
-            if not matches5.empty:
-                last_dates_str = matches5.groupby(level=0)[0].last()
-                dates5 = pd.to_datetime(
-                    last_dates_str, format="%d.%m.%Y", errors="coerce"
-                )
-                delta5 = (dates5 - today).dt.days
 
-                # спливає (0..10 днів)
-                idx_expiring = dates5.index[(delta5 >= 0) & (delta5 <= 10)]
-                self.expiring_indices.update(idx_expiring.tolist())
+            # берем только ПЕРВУЮ дату (ВІД)
+            first_dates_str = ser5.str.extract(r"(\d{2}\.\d{2}\.\d{4})")[0]
+            dates5 = pd.to_datetime(first_dates_str, format="%d.%m.%Y", errors="coerce")
 
-                # прострочені (<0)
-                idx_expired = dates5.index[delta5 < 0]
-                self.expired_indices.update(idx_expired.tolist())
+            # дата закінчення = +6 місяців
+            expiry_dates = dates5 + pd.DateOffset(months=6)
 
-        # ----- Колонка 8: № ОРС, дата заведення ... -----
-        col8 = next(
-            (c for c in df.columns if "№ОРС" in str(c) or "№ ОРС" in str(c) or "№ ОРС," in str(c)),
-            None,
-        )
-        if col8:
+            for idx in df.index:
+                d_exp = expiry_dates.loc[idx]
+                if pd.isna(d_exp):
+                    continue
+
+                days_left = (d_exp - today).days
+
+                # строк вже минув -> червоний весь рядок
+                if days_left < 0:
+                    self.expired_indices.add(idx)
+                # ≤10 діб до прострочки -> жовта клітинка в 5-й (індекс рядка, колонку знає модель)
+                elif 0 <= days_left <= 10:
+                    self.expiring_by5_indices.add(idx)
+
+        # ------------------------------------------------
+        # 2) 7–8 колонки — "не заведено ОРС"
+        # ------------------------------------------------
+        if col7 and col8:
+            ser7 = df[col7].astype(str)
             ser8 = df[col8].astype(str)
-            first_dates_str = ser8.str.extract(r"(\d{2}\.\d{2}\.\d{4})")[0]
-            dates8 = pd.to_datetime(
-                first_dates_str, format="%d.%m.%Y", errors="coerce"
-            )
-            delta8 = (today - dates8).dt.days
-            idxs8 = dates8.index[(delta8 >= 0) & (delta8 <= 20)]
-            self.expiring_indices.update(idxs8.tolist())
 
-        if show_popup and self.expiring_indices:
-            QMessageBox.warning(
-                self,
-                "Увага",
-                f"Є {len(self.expiring_indices)} запис(ів) зі строком, що спливає.",
-            )
-                    # оновлюємо стан кнопки "Показати строки зі строком, що спливає"
-        if hasattr(self, "btn_show_expiring"):
-            has_expiring = bool(self.expiring_indices)
-            self.btn_show_expiring.setEnabled(has_expiring)
+            d7 = ser7.str.extract(r"(\d{2}\.\d{2}\.\d{4})")[0]
+            d7 = pd.to_datetime(d7, format="%d.%m.%Y", errors="coerce")
 
-            # якщо строк, що спливають, більше немає — прибираємо режим фільтра
-            if not has_expiring:
-                self.show_only_expiring = False
-                self.btn_show_expiring.setChecked(False)
+            d8 = ser8.str.extract(r"(\d{2}\.\d{2}\.\d{4})")[0]
+            d8 = pd.to_datetime(d8, format="%d.%m.%Y", errors="coerce")
+
+            for idx in df.index:
+                base_date = d7.loc[idx]
+                ors_date = d8.loc[idx]
+
+                # якщо в 7-й немає дати — не перевіряємо
+                if pd.isna(base_date):
+                    continue
+
+                # якщо в 8-й вже є дата — усе добре
+                if not pd.isna(ors_date):
+                    continue
+
+                days_passed = (today - base_date).days
+
+                if 0 <= days_passed <= 20:
+                    self.ors_warning_indices.add(idx)
+                    self.ors_warning_rows.add(idx)
+                elif days_passed > 20:
+                    self.ors_overdue_indices.add(idx)
+                    self.ors_overdue_rows.add(idx)
+
+        # ------------------------------------------------
+        # 3) Попап з коротким резюме (якщо є що показати)
+        # ------------------------------------------------
+        if show_popup:
+            parts = []
+            if self.expired_indices:
+                parts.append(f"Прострочені строки (5-та колонка): {len(self.expired_indices)}")
+            if self.expiring_by5_indices:
+                parts.append(
+                    f"Строки, що спливають (≤10 діб, 5-та колонка): "
+                    f"{len(self.expiring_by5_indices)}"
+                )
+            if self.ors_warning_rows:
+                parts.append(f"Не заведено ОРС (до 20 діб): {len(self.ors_warning_rows)}")
+            if self.ors_overdue_rows:
+                parts.append(f"Не заведено ОРС (прострочено): {len(self.ors_overdue_rows)}")
+
+            if parts:
+                QMessageBox.warning(self, "Увага", "\n".join(parts))
 
     # --------------------------------------------------------
     #                Пошук дублікатів (ПІБ)
@@ -1674,8 +1755,13 @@ class MainWindow(QMainWindow):
             self.view_mode = "archive"
         elif index == 2:
             self.view_mode = "deleted"
+        elif index == 3:
+            self.view_mode = "expired"       # по 5-й колонке
+        elif index == 4:
+            self.view_mode = "ors_warning"   # 7–8 колонки, до 20 діб
         else:
-            self.view_mode = "expired"
+            self.view_mode = "ors_overdue"   # 7–8 колонки, прострочено
+
         self.update_action_buttons_state()
         self.apply_all_filters()
 
@@ -1695,7 +1781,9 @@ class MainWindow(QMainWindow):
             self.btn_from_archive.setEnabled(False)
             self.btn_delete_rows.setEnabled(False)
             self.btn_restore_rows.setEnabled(True)
-        else:  # expired view
+        else:
+            # expired / ors_warning / ors_overdue —
+            # даём полный доступ к операциям
             self.btn_to_archive.setEnabled(True)
             self.btn_from_archive.setEnabled(True)
             self.btn_delete_rows.setEnabled(True)
@@ -1737,12 +1825,12 @@ class MainWindow(QMainWindow):
                 df = df[(df["is_deleted"] == False) & (df["is_archived"] == True)]
             elif self.view_mode == "deleted":
                 df = df[df["is_deleted"] == True]
-            else:  # expired
+            elif self.view_mode == "expired":
                 df = df[(df["is_deleted"] == False) & (df.index.isin(self.expired_indices))]
-
-        # 5) показати лише "спливаючі" строки (якщо ввімкнено)
-        if self.show_only_expiring and self.expiring_indices:
-            df = df[df.index.isin(self.expiring_indices)]
+            elif self.view_mode == "ors_warning":
+                df = df[(df["is_deleted"] == False) & (df.index.isin(self.ors_warning_indices))]
+            elif self.view_mode == "ors_overdue":
+                df = df[(df["is_deleted"] == False) & (df.index.isin(self.ors_overdue_indices))]
 
         self.df_current = df
 
@@ -1750,20 +1838,31 @@ class MainWindow(QMainWindow):
         if isinstance(model, PandasTableModel):
             model.update_df(
                 self.df_current,
-                expiring_indices=self.expiring_indices,
+                expiring_by5_indices=self.expiring_by5_indices,
                 expired_indices=self.expired_indices,
                 duplicate_indices=self.duplicate_indices,
+                ors_warning_indices=self.ors_warning_indices,
+                ors_overdue_indices=self.ors_overdue_indices,
+                col5_name=self.col5_name,
+                col7_name=self.col7_name,
+                col8_name=self.col8_name,
             )
         else:
             self.table_view.setModel(
                 PandasTableModel(
                     self.df_current,
                     edit_callback=self.on_cell_edited,
-                    expiring_indices=self.expiring_indices,
+                    expiring_by5_indices=self.expiring_by5_indices,
                     expired_indices=self.expired_indices,
                     duplicate_indices=self.duplicate_indices,
+                    ors_warning_indices=self.ors_warning_indices,
+                    ors_overdue_indices=self.ors_overdue_indices,
+                    col5_name=self.col5_name,
+                    col7_name=self.col7_name,
+                    col8_name=self.col8_name,
                 )
             )
+
         self.hide_service_columns()
 
     # --------------------------------------------------------
