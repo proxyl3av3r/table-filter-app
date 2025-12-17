@@ -1,4 +1,3 @@
-import unicodedata
 import sys
 import os
 import json
@@ -275,6 +274,10 @@ class MatchAnalysisDialog(QDialog):
         self.list_matches_pib = QListWidget()
         mp_pib.addWidget(self.list_matches_pib)
 
+        self.btn_export_matches_pib = QPushButton("Експорт збігів у Word/Excel/CSV")
+        self.btn_export_matches_pib.setEnabled(False)
+        mp_pib.addWidget(self.btn_export_matches_pib)
+
         unique_panel_pib = QWidget()
         up_pib = QVBoxLayout(unique_panel_pib)
         up_pib.setContentsMargins(0, 0, 0, 0)
@@ -282,7 +285,7 @@ class MatchAnalysisDialog(QDialog):
         self.list_unique_pib = QListWidget()
         up_pib.addWidget(self.list_unique_pib)
 
-        self.btn_export_unique_pib = QPushButton("Експорт унікальних у CSV/Excel")
+        self.btn_export_unique_pib = QPushButton("Експорт унікальних у Word/Excel/CSV")
         self.btn_export_unique_pib.setEnabled(False)
         up_pib.addWidget(self.btn_export_unique_pib)
 
@@ -307,6 +310,10 @@ class MatchAnalysisDialog(QDialog):
         self.list_matches_ors = QListWidget()
         mp_ors.addWidget(self.list_matches_ors)
 
+        self.btn_export_matches_ors = QPushButton("Експорт збігів у Word/Excel/CSV")
+        self.btn_export_matches_ors.setEnabled(False)
+        mp_ors.addWidget(self.btn_export_matches_ors)
+
         unique_panel_ors = QWidget()
         up_ors = QVBoxLayout(unique_panel_ors)
         up_ors.setContentsMargins(0, 0, 0, 0)
@@ -314,7 +321,7 @@ class MatchAnalysisDialog(QDialog):
         self.list_unique_ors = QListWidget()
         up_ors.addWidget(self.list_unique_ors)
 
-        self.btn_export_unique_ors = QPushButton("Експорт унікальних у CSV/Excel")
+        self.btn_export_unique_ors = QPushButton("Експорт унікальних у Word/Excel/CSV")
         self.btn_export_unique_ors.setEnabled(False)
         up_ors.addWidget(self.btn_export_unique_ors)
 
@@ -340,6 +347,10 @@ class MatchAnalysisDialog(QDialog):
             lambda: self.export_unique_rows("pib")
         )
 
+        self.btn_export_matches_pib.clicked.connect(
+            lambda: self.export_matches_rows("pib")
+        )
+
         self.list_matches_ors.itemSelectionChanged.connect(
             lambda: self.on_match_selected("ors")
         )
@@ -348,6 +359,10 @@ class MatchAnalysisDialog(QDialog):
         )
         self.btn_export_unique_ors.clicked.connect(
             lambda: self.export_unique_rows("ors")
+        )
+
+        self.btn_export_matches_ors.clicked.connect(
+            lambda: self.export_matches_rows("ors")
         )
 
         # --------------------------------------------------------
@@ -621,75 +636,113 @@ class MatchAnalysisDialog(QDialog):
 
     # --- внутрішній аналіз по ПІБ ---
 
-    @staticmethod
-    def _normalize_for_match(value: str) -> str:
-        """Нормалізація рядків для пошуку ПІБ у тексті (тільки для вікна порівняння).
-        Прибирає 'невидимі' пробіли/символи, уніфікує апостроф/дефіс, схлопує пробіли та робить casefold.
+    import re
+    import unicodedata
+
+    def _normalize_pib_flexible(self, value: str) -> str:
         """
-        if value is None:
+        Максимально гибкая нормализация ПІБ:
+        - игнор апострофов, дефисов, пунктуации
+        - схлопывание пробелов
+        - удаление невидимых символов
+        - латиница → кириллица (визуальные двойники)
+        - регистр не учитывается
+        """
+        if not value:
             return ""
+
         s = str(value)
 
-        # Unicode нормалізація
+        # Unicode нормализация
         s = unicodedata.normalize("NFKC", s)
 
-        # Нестандартні/невидимі пробіли
-        s = s.replace("\u00A0", " ")
-        s = s.replace("\u202F", " ")
-        s = s.replace("\u200B", "")
+        # невидимые и нестандартные пробелы
+        for sp in ("\u00A0", "\u200B", "\u202F", "\ufeff"):
+            s = s.replace(sp, " ")
 
-        # Апострофи/дефіси
-        s = s.replace("’", "'").replace("ʼ", "'").replace("`", "'").replace("´", "'")
-        s = s.replace("–", "-").replace("—", "-")
+        # латинские символы, похожие на кириллицу
+        s = s.translate(str.maketrans({
+            "A": "А", "a": "а",
+            "B": "В",
+            "C": "С", "c": "с",
+            "E": "Е", "e": "е",
+            "H": "Н",
+            "I": "І", "i": "і",
+            "K": "К",
+            "M": "М",
+            "O": "О", "o": "о",
+            "P": "Р", "p": "р",
+            "T": "Т",
+            "X": "Х", "x": "х",
+            "Y": "У", "y": "у",
+        }))
 
-        # Схлопнути пробіли
+        # удаляем апострофы и дефисы полностью
+        s = re.sub(r"[’ʼ'`´\-–—−‐]", "", s)
+
+        # убираем всю пунктуацию
+        s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
+
+        # схлопываем пробелы
         s = re.sub(r"\s+", " ", s).strip()
 
         return s.casefold()
 
-        def _find_pib_matches(self):
-            pib_series = self._get_pib_series()
 
-            # очищаємо вкладку ПІБ
-            self.pib_matches = []
-            self.pib_unique_rows = None
-            self.list_matches_pib.clear()
-            self.list_unique_pib.clear()
-            self.btn_export_unique_pib.setEnabled(False)
-            self.btn_export_matches_pib.setEnabled(False)
+    def _normalize_text_for_search(self, text: str) -> str:
+        """
+        Та же нормализация, но для ВСЕГО текста документа,
+        чтобы поиск был честным.
+        """
+        if not text:
+            return ""
+        return self._normalize_pib_flexible(text)
 
-            if pib_series is None:
-                # немає інформації про ПІБ у лівій таблиці
-                return
+    def _find_pib_matches(self):
+        pib_series = self._get_pib_series()
 
-            # Нормалізуємо текст правого документу (щоб NBSP/zero-width/різні апострофи не ламали пошук)
-            norm_text = self._normalize_for_match(self.right_text)
+        # очистка вкладки ПІБ
+        self.pib_matches = []
+        self.pib_unique_rows = None
+        self.list_matches_pib.clear()
+        self.list_unique_pib.clear()
+        self.btn_export_unique_pib.setEnabled(False)
+        self.btn_export_matches_pib.setEnabled(False)
 
-            matched_idx: set[int] = set()
+        if pib_series is None or self.left_df is None:
+            return
 
-            for idx, val in pib_series.items():
-                name = str(val).split(",")[0].strip()
-                if not name:
-                    continue
+        # нормализуем ВЕСЬ текст документа один раз
+        norm_text = self._normalize_text_for_search(self.right_text)
 
-                norm_name = self._normalize_for_match(name)
-                if norm_name and norm_name in norm_text:
-                    count = norm_text.count(norm_name)
-                    self.pib_matches.append((idx, name))
-                    self.list_matches_pib.addItem(f"{idx}: {name} ({count})")
-                    matched_idx.add(idx)
+        matched_idx: set[int] = set()
 
-            # унікальні по ПІБ
-            self.pib_unique_rows = self.left_df[~self.left_df.index.isin(matched_idx)].copy()
-            for idx, val in pib_series.items():
-                if idx not in matched_idx:
-                    self.list_unique_pib.addItem(f"{idx}: {val}")
+        for idx, raw_name in pib_series.items():
+            name = str(raw_name).split(",")[0].strip()
+            if not name:
+                continue
 
-            self.btn_export_unique_pib.setEnabled(
-                self.pib_unique_rows is not None and not self.pib_unique_rows.empty
-            )
+            norm_name = self._normalize_pib_flexible(name)
+            if not norm_name:
+                continue
 
-            self.btn_export_matches_pib.setEnabled(len(self.pib_matches) > 0)
+            if norm_name in norm_text:
+                count = norm_text.count(norm_name)
+                self.pib_matches.append((idx, name))
+                self.list_matches_pib.addItem(f"{idx}: {name} ({count})")
+                matched_idx.add(idx)
+
+        # уникальные строки
+        self.pib_unique_rows = self.left_df[~self.left_df.index.isin(matched_idx)].copy()
+
+        for idx, raw_name in pib_series.items():
+            if idx not in matched_idx:
+                self.list_unique_pib.addItem(f"{idx}: {raw_name}")
+
+        self.btn_export_unique_pib.setEnabled(
+            self.pib_unique_rows is not None and not self.pib_unique_rows.empty
+        )
+        self.btn_export_matches_pib.setEnabled(len(self.pib_matches) > 0)
 
     # --- внутрішній аналіз по ОРС ---
 
@@ -702,6 +755,7 @@ class MatchAnalysisDialog(QDialog):
         self.list_matches_ors.clear()
         self.list_unique_ors.clear()
         self.btn_export_unique_ors.setEnabled(False)
+        self.btn_export_matches_ors.setEnabled(False)
 
         if ors_series is None:
             # взагалі не вдалось витягнути номери
@@ -730,6 +784,8 @@ class MatchAnalysisDialog(QDialog):
         self.btn_export_unique_ors.setEnabled(
             self.ors_unique_rows is not None and not self.ors_unique_rows.empty
         )
+
+        self.btn_export_matches_ors.setEnabled(len(self.ors_matches) > 0)
 
     # ============================================================
     #            ПІДСВІЧЕННЯ ВСІХ ЗБІГІВ (ЛИШЕ ДЛЯ ПІБ)
@@ -936,35 +992,103 @@ class MatchAnalysisDialog(QDialog):
     #                       ЕКСПОРТ УНІКАЛЬНИХ
     # ============================================================
 
+    def _format_df_for_export(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Форматування як у головному вікні: без service-колонок + нормальні дати/булі."""
+        out = df.copy()
+        for c in SERVICE_COLS:
+            if c in out.columns:
+                out = out.drop(columns=[c])
+        for col in out.columns:
+            if pd.api.types.is_datetime64_any_dtype(out[col]):
+                out[col] = out[col].dt.strftime("%d.%m.%Y").fillna("")
+            elif pd.api.types.is_bool_dtype(out[col]):
+                out[col] = out[col].map({True: "Так", False: "Ні"})
+        return out
+
+    def _export_df(self, df: pd.DataFrame, title: str):
+        if df is None or df.empty:
+            QMessageBox.information(self, "Немає даних", "Немає рядків для експорту.")
+            return
+
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            title,
+            "",
+            "Word (*.docx);;Excel (*.xlsx);;CSV (*.csv)",
+        )
+        if not path:
+            return
+
+        try:
+            df_out = self._format_df_for_export(df)
+
+            if path.lower().endswith(".docx") or "Word" in selected_filter:
+                doc = Document()
+
+                # Альбомна орієнтація
+                section = doc.sections[0]
+                section.orientation = WD_ORIENT.LANDSCAPE
+                new_width, new_height = section.page_height, section.page_width
+                section.page_width = new_width
+                section.page_height = new_height
+
+                table = doc.add_table(rows=1, cols=len(df_out.columns))
+                table.style = "Table Grid"
+
+                hdr_cells = table.rows[0].cells
+                for j, col_name in enumerate(df_out.columns):
+                    hdr_cells[j].text = str(col_name)
+
+                for _, row in df_out.iterrows():
+                    row_cells = table.add_row().cells
+                    for j, col_name in enumerate(df_out.columns):
+                        value = row[col_name]
+                        row_cells[j].text = "" if pd.isna(value) else str(value)
+
+                doc.save(path)
+
+            elif path.lower().endswith(".xlsx") or "Excel" in selected_filter:
+                df_out.to_excel(path, index=False)
+            else:
+                df_out.to_csv(path, index=False)
+
+            QMessageBox.information(self, "OK", f"Файл збережено:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Помилка", str(e))
+
     def export_unique_rows(self, mode: str):
         if mode == "pib":
             unique_rows = self.pib_unique_rows
         else:
             unique_rows = self.ors_unique_rows
 
-        if unique_rows is None or unique_rows.empty:
-            QMessageBox.information(self, "Немає даних", "Немає унікальних рядків.")
+        self._export_df(unique_rows, "Зберегти унікальні рядки")
+
+    def export_matches_rows(self, mode: str):
+        if self.left_df is None or self.left_df.empty:
+            QMessageBox.information(self, "Немає даних", "Немає лівої таблиці.")
             return
 
-        path, selected = QFileDialog.getSaveFileName(
-            self,
-            "Зберегти унікальні рядки",
-            "",
-            "Excel (*.xlsx);;CSV (*.csv)"
-        )
-        if not path:
+        if mode == "pib":
+            indices = [idx for idx, _ in self.pib_matches]
+        else:
+            indices = [idx for idx, _ in self.ors_matches]
+
+        if not indices:
+            QMessageBox.information(self, "Немає даних", "Немає збігів для експорту.")
             return
 
-        try:
-            if path.endswith(".xlsx") or "Excel" in selected:
-                unique_rows.to_excel(path, index=False)
-            else:
-                unique_rows.to_csv(path, index=False)
+        # На випадок повторів — унікалізуємо, але порядок зберігаємо
+        seen = set()
+        ordered = []
+        for i in indices:
+            if i not in seen:
+                seen.add(i)
+                ordered.append(i)
 
-            QMessageBox.information(self, "OK", f"Файл збережено:\n{path}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Помилка", str(e))
+        # .loc зберігає порядок списку `ordered`
+        df_matches = self.left_df.loc[ordered].copy()
+        self._export_df(df_matches, "Зберегти збіги")
 
 # ============================================================
 #                      ГОЛОВНЕ ВІКНО
