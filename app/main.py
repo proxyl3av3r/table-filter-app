@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 from typing import Any, Set
 
+import re
+import unicodedata
+
 import pandas as pd
 from docx import Document
 from docx.enum.section import WD_ORIENT
@@ -636,31 +639,27 @@ class MatchAnalysisDialog(QDialog):
 
     # --- внутрішній аналіз по ПІБ ---
 
-    import re
-    import unicodedata
-
     def _normalize_pib_flexible(self, value: str) -> str:
         """
-        Максимально гибкая нормализация ПІБ:
-        - игнор апострофов, дефисов, пунктуации
-        - схлопывание пробелов
-        - удаление невидимых символов
-        - латиница → кириллица (визуальные двойники)
-        - регистр не учитывается
+        Дуже гнучка нормалізація ПІБ для порівняння (тільки в цьому вікні):
+        - ігнорує апострофи/тире/пунктуацію
+        - прибирає невидимі символи та нестандартні пробіли
+        - вирівнює латиницю↔кирилицю для візуальних «двійників»
+        - не залежить від регістру
         """
-        if not value:
+        if value is None:
             return ""
 
         s = str(value)
 
-        # Unicode нормализация
+        # Unicode нормалізація
         s = unicodedata.normalize("NFKC", s)
 
-        # невидимые и нестандартные пробелы
+        # невидимі/нестандартні пробіли
         for sp in ("\u00A0", "\u200B", "\u202F", "\ufeff"):
             s = s.replace(sp, " ")
 
-        # латинские символы, похожие на кириллицу
+        # латинські «двійники» -> кирилиця
         s = s.translate(str.maketrans({
             "A": "А", "a": "а",
             "B": "В",
@@ -677,31 +676,25 @@ class MatchAnalysisDialog(QDialog):
             "Y": "У", "y": "у",
         }))
 
-        # удаляем апострофы и дефисы полностью
+        # прибираємо апострофи і тире повністю
         s = re.sub(r"[’ʼ'`´\-–—−‐]", "", s)
 
-        # убираем всю пунктуацию
+        # прибираємо пунктуацію
         s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
 
-        # схлопываем пробелы
+        # схлопуємо пробіли
         s = re.sub(r"\s+", " ", s).strip()
 
         return s.casefold()
 
-
     def _normalize_text_for_search(self, text: str) -> str:
-        """
-        Та же нормализация, но для ВСЕГО текста документа,
-        чтобы поиск был честным.
-        """
-        if not text:
-            return ""
-        return self._normalize_pib_flexible(text)
+        """Нормалізація всього тексту документа для коректного пошуку."""
+        return self._normalize_pib_flexible(text or "")
 
     def _find_pib_matches(self):
         pib_series = self._get_pib_series()
 
-        # очистка вкладки ПІБ
+        # очищаємо вкладку ПІБ
         self.pib_matches = []
         self.pib_unique_rows = None
         self.list_matches_pib.clear()
@@ -712,13 +705,13 @@ class MatchAnalysisDialog(QDialog):
         if pib_series is None or self.left_df is None:
             return
 
-        # нормализуем ВЕСЬ текст документа один раз
+        # нормалізуємо ВЕСЬ текст документа один раз
         norm_text = self._normalize_text_for_search(self.right_text)
 
         matched_idx: set[int] = set()
 
         for idx, raw_name in pib_series.items():
-            name = str(raw_name).split(",")[0].strip()
+            name = str(raw_name).split(",", 1)[0].strip()
             if not name:
                 continue
 
@@ -732,7 +725,7 @@ class MatchAnalysisDialog(QDialog):
                 self.list_matches_pib.addItem(f"{idx}: {name} ({count})")
                 matched_idx.add(idx)
 
-        # уникальные строки
+        # унікальні рядки по ПІБ
         self.pib_unique_rows = self.left_df[~self.left_df.index.isin(matched_idx)].copy()
 
         for idx, raw_name in pib_series.items():
