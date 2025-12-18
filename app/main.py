@@ -2,12 +2,14 @@ import sys
 import os
 import json
 from pathlib import Path
-from typing import Any, Set
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Set, Optional
 
 import re
 import unicodedata
-
 import pandas as pd
+
 from docx import Document
 from docx.enum.section import WD_ORIENT
 
@@ -19,22 +21,21 @@ from PySide6.QtWidgets import (
     QFormLayout, QDialogButtonBox, QTabWidget,
     QAbstractItemView, QSplitter, QTextEdit,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QPixmap, QTextCursor, QTextCharFormat, QColor
 
-from app.model import PandasTableModel
-from app.load_test_data import load_test_df
-from app.filters_core import FilterCondition, Operator, apply_filters
 
 CONFIG_PATH = Path.home() / ".table_filter_engine.json"
-STATE_PATH = Path.home() / ".table_filter_engine_state.pkl"  # для збереження стану
+STATE_PATH = Path.home() / ".table_filter_engine_state.pkl"
 SERVICE_COLS = {"is_archived", "is_deleted"}
 
 
+# ============================================================
+#                 УТИЛИТЫ / ЗАГРУЗКА ТАБЛИЦ
+# ============================================================
+
 def resource_path(rel_path: str) -> Path:
-    """
-    Корректный путь до ресурсов и в dev, и в exe (PyInstaller).
-    """
+    """Корректный путь до ресурсов и в dev, и в exe (PyInstaller)."""
     if hasattr(sys, "_MEIPASS"):
         base = Path(sys._MEIPASS)
     else:
@@ -42,43 +43,321 @@ def resource_path(rel_path: str) -> Path:
     return base / rel_path
 
 
+def _load_from_docx_first_table(path: str) -> pd.DataFrame:
+    """
+    Берём первую "осмысленную" таблицу из docx.
+    Важно: делаем прямоугольник — строки, где меньше колонок, добиваем пустыми.
+    """
+    doc = Document(path)
+    table = None
+    for t in doc.tables:
+        if len(t.rows) >= 2 and len(t.rows[0].cells) >= 2:
+            table = t
+            break
+    if table is None:
+        raise ValueError("У документі Word не знайдено підходящої таблиці.")
+
+    headers = [c.text.strip() for c in table.rows[0].cells]
+    rows = []
+    for r in table.rows[1:]:
+        vals = [c.text.strip() for c in r.cells]
+        if len(vals) < len(headers):
+            vals += [""] * (len(headers) - len(vals))
+        elif len(vals) > len(headers):
+            # если где-то внезапно больше — расширяем хедеры
+            extra = len(vals) - len(headers)
+            headers += [f"Col {len(headers)+i+1}" for i in range(extra)]
+        rows.append(vals)
+
+    df = pd.DataFrame(rows, columns=headers)
+    return df.fillna("")
+
+
+def load_test_df(path: str) -> pd.DataFrame:
+    """
+    Универсальный загрузчик: csv/xlsx/xls/docx.
+    Для csv: автоопределение sep.
+    """
+    p = Path(path)
+    ext = p.suffix.lower()
+
+    if ext == ".csv":
+        df = pd.read_csv(path, dtype=str, sep=None, engine="python").fillna("")
+        return df
+
+    if ext in (".xlsx", ".xls"):
+        df = pd.read_excel(path, dtype=str).fillna("")
+        return df
+
+    if ext == ".docx":
+        return _load_from_docx_first_table(path)
+
+    raise ValueError(f"Формат не підтримується: {ext}")
+
+
+# ============================================================
+#                        ФИЛЬТРЫ
+# ============================================================
+
+class Operator(str, Enum):
+    CONTAINS = "contains"
+    EQUALS = "equals"
+    NOT_EQUALS = "not_equals"
+    RANGE = "range"
+
+
+@dataclass
+class FilterCondition:
+    column: str
+    operator: Operator
+    value: Any
+
+
+def _to_datetime_series(series: pd.Series) -> pd.Series:
+    # пытаемся вытащить dd.mm.yyyy из строк и распарсить
+    s = series.astype(str)
+    d = s.str.extract(r"(\d{2}\.\d{2}\.\d{4})")[0]
+    return pd.to_datetime(d, format="%d.%m.%Y", errors="coerce")
+
+
+def apply_filters(df: pd.DataFrame, conditions: list[FilterCondition]) -> pd.DataFrame:
+    out = df
+    for cond in conditions:
+        if cond.column not in out.columns:
+            continue
+        ser = out[cond.column]
+
+        if cond.operator == Operator.CONTAINS:
+            v = str(cond.value)
+            mask = ser.astype(str).str.contains(v, case=False, na=False)
+            out = out[mask]
+
+        elif cond.operator == Operator.EQUALS:
+            v = cond.value
+            # делаем мягкое сравнение строками
+            mask = ser.astype(str).str.strip().eq(str(v).strip())
+            out = out[mask]
+
+        elif cond.operator == Operator.NOT_EQUALS:
+            v = cond.value
+            mask = ~ser.astype(str).str.strip().eq(str(v).strip())
+            out = out[mask]
+
+        elif cond.operator == Operator.RANGE:
+            d_from, d_to = cond.value
+            dser = _to_datetime_series(ser)
+            mask = pd.Series(True, index=out.index)
+            if d_from is not None:
+                mask &= dser >= d_from
+            if d_to is not None:
+                mask &= dser <= d_to
+            out = out[mask]
+
+    return out
+
+
+# ============================================================
+#                     МОДЕЛЬ ДЛЯ QTableView
+# ============================================================
+
+class PandasTableModel(QAbstractTableModel):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        edit_callback=None,
+        expiring_by5_indices: Optional[Set[Any]] = None,
+        expired_indices: Optional[Set[Any]] = None,
+        duplicate_indices: Optional[Set[Any]] = None,
+        ors_warning_indices: Optional[Set[Any]] = None,
+        ors_overdue_indices: Optional[Set[Any]] = None,
+        col5_name: str | None = None,
+        col7_name: str | None = None,
+        col8_name: str | None = None,
+    ):
+        super().__init__()
+        self.df = df if df is not None else pd.DataFrame()
+        self.edit_callback = edit_callback
+
+        self.expiring_by5_indices = expiring_by5_indices or set()
+        self.expired_indices = expired_indices or set()
+        self.duplicate_indices = duplicate_indices or set()
+        self.ors_warning_indices = ors_warning_indices or set()
+        self.ors_overdue_indices = ors_overdue_indices or set()
+
+        self.col5_name = col5_name
+        self.col7_name = col7_name
+        self.col8_name = col8_name
+
+    def update_df(
+        self,
+        df: pd.DataFrame,
+        expiring_by5_indices: Optional[Set[Any]] = None,
+        expired_indices: Optional[Set[Any]] = None,
+        duplicate_indices: Optional[Set[Any]] = None,
+        ors_warning_indices: Optional[Set[Any]] = None,
+        ors_overdue_indices: Optional[Set[Any]] = None,
+        col5_name: str | None = None,
+        col7_name: str | None = None,
+        col8_name: str | None = None,
+    ):
+        self.beginResetModel()
+        self.df = df if df is not None else pd.DataFrame()
+        self.expiring_by5_indices = expiring_by5_indices or set()
+        self.expired_indices = expired_indices or set()
+        self.duplicate_indices = duplicate_indices or set()
+        self.ors_warning_indices = ors_warning_indices or set()
+        self.ors_overdue_indices = ors_overdue_indices or set()
+        self.col5_name = col5_name
+        self.col7_name = col7_name
+        self.col8_name = col8_name
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if self.df is None else len(self.df.index)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if self.df is None else len(self.df.columns)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role != Qt.DisplayRole or self.df is None:
+            return None
+        if orientation == Qt.Horizontal:
+            try:
+                return str(self.df.columns[section])
+            except Exception:
+                return ""
+        else:
+            try:
+                return str(self.df.index[section])
+            except Exception:
+                return ""
+
+    def flags(self, index: QModelIndex):
+        if not index.isValid():
+            return Qt.NoItemFlags
+        base = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        if self.edit_callback is not None:
+            # запретим редактировать service-колонки
+            col_name = str(self.df.columns[index.column()])
+            if col_name not in SERVICE_COLS:
+                base |= Qt.ItemIsEditable
+        return base
+
+    def data(self, index: QModelIndex, role=Qt.DisplayRole):
+        if not index.isValid() or self.df is None:
+            return None
+
+        r = index.row()
+        c = index.column()
+
+        try:
+            orig_index = self.df.index[r]
+            col_name = str(self.df.columns[c])
+            val = self.df.iloc[r, c]
+        except Exception:
+            return None
+
+        if role == Qt.DisplayRole:
+            if pd.isna(val):
+                return ""
+            return str(val)
+
+        # ----------- подсветка -----------
+        if role == Qt.BackgroundRole:
+            # Архив - зелёный весь ряд
+            if "is_archived" in self.df.columns:
+                try:
+                    if bool(self.df.at[orig_index, "is_archived"]):
+                        return QColor("#d6f5d6")
+                except Exception:
+                    pass
+
+            # Удалённые - серый ряд (если вдруг показывают)
+            if "is_deleted" in self.df.columns:
+                try:
+                    if bool(self.df.at[orig_index, "is_deleted"]):
+                        return QColor("#eeeeee")
+                except Exception:
+                    pass
+
+            # Просрочка по 5-й колонке - красный весь ряд
+            if orig_index in self.expired_indices:
+                return QColor("#ffb3b3")
+
+            # Дубликат ПІБ - синий весь ряд
+            if orig_index in self.duplicate_indices:
+                return QColor("#cfe8ff")
+
+            # Жёлтая клетка в 5-й колонке
+            if self.col5_name and orig_index in self.expiring_by5_indices:
+                if col_name == self.col5_name:
+                    return QColor("#fff2a8")
+
+            # ОРС warning/overdue: подсветка клеток в 7 и 8
+            if self.col7_name and self.col8_name:
+                if col_name in (self.col7_name, self.col8_name):
+                    if orig_index in self.ors_overdue_indices:
+                        return QColor("#ffb3b3")
+                    if orig_index in self.ors_warning_indices:
+                        return QColor("#fff2a8")
+
+        return None
+
+    def setData(self, index: QModelIndex, value, role=Qt.EditRole):
+        if role != Qt.EditRole or not index.isValid() or self.df is None:
+            return False
+
+        r = index.row()
+        c = index.column()
+        try:
+            orig_index = self.df.index[r]
+            col_name = str(self.df.columns[c])
+        except Exception:
+            return False
+
+        if col_name in SERVICE_COLS:
+            return False
+
+        new_val = "" if value is None else str(value)
+
+        # обновим df текущий
+        self.df.iat[r, c] = new_val
+
+        # колбэк — синхронизировать с df_original в MainWindow
+        if self.edit_callback:
+            self.edit_callback(orig_index, col_name, new_val)
+
+        self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.BackgroundRole])
+        return True
+
+
 # ============================================================
 #                 ДІАЛОГ ДОДАВАННЯ РЯДКА
 # ============================================================
 
 class AddRowDialog(QDialog):
-    """
-    Діалог додавання нового запису.
-    Поля максимально наближені до реальних колонок фінальної таблиці.
-    """
-
     def __init__(self, prosecutors: list[str] | None = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Додати новий запис")
         self.setModal(True)
 
         prosecutors = prosecutors or []
-
         layout = QFormLayout(self)
 
-        # 1. Прокуратура
         self.prosecutor_cb = QComboBox(self)
         self.prosecutor_cb.addItem("")
         for p in sorted(prosecutors):
             self.prosecutor_cb.addItem(str(p))
         layout.addRow("Прокуратура:", self.prosecutor_cb)
 
-        # 2. № кримінального провадження, дата реєстрації, кваліфікація, орган розслідування
         self.case_edit = QLineEdit(self)
         self.case_edit.setPlaceholderText("№ провадження, дата, кваліфікація, орган…")
         layout.addRow("№ провадження / кваліфікація:", self.case_edit)
 
-        # 3. Фабула
         self.fabula_edit = QLineEdit(self)
         self.fabula_edit.setPlaceholderText("Коротка фабула…")
         layout.addRow("Фабула:", self.fabula_edit)
 
-        # 4. ПІБ + дата нар. + дата повідомлення підозри
         self.pib_edit = QLineEdit(self)
         self.pib_edit.setPlaceholderText("Прізвище Ім'я По батькові")
         layout.addRow("ПІБ підозрюваного:", self.pib_edit)
@@ -91,42 +370,34 @@ class AddRowDialog(QDialog):
         self.notice_date_edit.setPlaceholderText("дд.мм.рррр")
         layout.addRow("Дата повідомлення підозри:", self.notice_date_edit)
 
-        # 5. Запобіжний захід / ухвала
         self.measure_edit = QLineEdit(self)
         self.measure_edit.setPlaceholderText("Тримання під вартою / застава / ухвала …")
         layout.addRow("Запобіжний захід:", self.measure_edit)
 
-        # 6. Підстава, дата зупинення
         self.stop_edit = QLineEdit(self)
         self.stop_edit.setPlaceholderText("Підстава, дата зупинення…")
         layout.addRow("Зупинення розслідування:", self.stop_edit)
 
-        # 7. Доручення / клопотання про розшук
         self.order_edit = QLineEdit(self)
         self.order_edit.setPlaceholderText("Дата, вих. №, слідчий, адресат…")
         layout.addRow("Доручення / клопотання:", self.order_edit)
 
-        # 8. № ОРС
         self.ors_edit = QLineEdit(self)
         self.ors_edit.setPlaceholderText("№ ОРС, дата заведення, категорія, орган…")
         layout.addRow("№ ОРС:", self.ors_edit)
 
-        # 9. Перетин кордону
         self.border_edit = QLineEdit(self)
         self.border_edit.setPlaceholderText("Так/Ні, дата отримання інформації…")
         layout.addRow("Перетин кордону:", self.border_edit)
 
-        # 10. Адмін. відповідальність
         self.admin_edit = QLineEdit(self)
         self.admin_edit.setPlaceholderText("Так/Ні, стаття, дата…")
         layout.addRow("Адмін. відповідальність:", self.admin_edit)
 
-        # 11. Міжнародний розшук / Інтерпол
         self.interpol_edit = QLineEdit(self)
         self.interpol_edit.setPlaceholderText("Дата оголошення, № картки Інтерполу…")
         layout.addRow("Міжнародний розшук:", self.interpol_edit)
 
-        # Кнопки
         btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         btn_box.accepted.connect(self.accept)
         btn_box.rejected.connect(self.reject)
@@ -155,50 +426,29 @@ class AddRowDialog(QDialog):
 # ============================================================
 
 class MatchAnalysisDialog(QDialog):
-    """
-    Аналіз збігів між лівою таблицею та зовнішнім документом.
-    Режими:
-      - ПІБ (за прізвищем/ПІБ, у т.ч. коли ПІБ у трьох окремих колонках)
-      - ОРС (за номером ОРС / ОРД / РД, витягнутим з рядка)
-    """
-
     def __init__(self, parent=None, current_df: pd.DataFrame | None = None):
         super().__init__(parent)
         self.setWindowTitle("Аналіз збігів")
         self.resize(1400, 820)
 
-        # === основні дані ===
         self.current_df = current_df
-        self.left_df: pd.DataFrame | None = None       # таблиця зліва
-        self.right_text: str = ""                      # суцільний текст документа справа
-        self.right_df: pd.DataFrame | None = None      # таблиця з документа (якщо є)
+        self.left_df: pd.DataFrame | None = None
+        self.right_text: str = ""
+        self.right_df: pd.DataFrame | None = None
 
-        # --- результати по ПІБ ---
-        # список збігів: (index у left_df, ПІБ)
         self.pib_matches: list[tuple[int, str]] = []
         self.pib_unique_rows: pd.DataFrame | None = None
 
-        # --- результати по ОРС ---
-        # список збігів: (index у left_df, номер_ОРС_як_рядок)
         self.ors_matches: list[tuple[int, str]] = []
         self.ors_unique_rows: pd.DataFrame | None = None
 
-        # для циклічного переходу по вхождениях унікальних ПІБ / ОРС
-        # ключ: (mode, name_lower), значення: номер поточного входження
         self._unique_pos_index: dict[tuple[str, str], int] = {}
-
-        # поточний режим вкладки внизу: "pib" або "ors"
         self.current_mode: str = "pib"
 
-        # --------------------------------------------------------
-        #                      ВЕРХНЯ ПАНЕЛЬ
-        # --------------------------------------------------------
         top = QHBoxLayout()
-
         self.btn_use_current = QPushButton("Використати поточну таблицю")
         self.btn_load_table = QPushButton("Завантажити таблицю…")
         self.btn_load_doc = QPushButton("Завантажити документ справа…")
-
         self.btn_find_matches = QPushButton("Знайти збіги")
         self.btn_find_matches.setEnabled(False)
 
@@ -213,24 +463,15 @@ class MatchAnalysisDialog(QDialog):
         self.btn_load_doc.clicked.connect(self.load_right_document)
         self.btn_find_matches.clicked.connect(self.find_matches)
 
-        # --------------------------------------------------------
-        #                    ЦЕНТРАЛЬНА ЧАСТИНА
-        # --------------------------------------------------------
-
-        # ліва таблиця
         self.left_table = QTableView()
         self.left_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.left_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.left_table.horizontalHeader().setStretchLastSection(True)
 
-        # справа — вкладки "Текст" і "Таблиця"
         self.right_tabs = QTabWidget()
-
-        # текст документа з підсвіченням
         self.right_text_edit = QTextEdit()
         self.right_text_edit.setReadOnly(True)
 
-        # таблиця з документа
         self.right_table = QTableView()
         self.right_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.right_table.horizontalHeader().setStretchLastSection(True)
@@ -239,7 +480,6 @@ class MatchAnalysisDialog(QDialog):
         self.right_tabs.addTab(self.right_table, "Таблиця")
         self.right_tabs.setTabEnabled(1, False)
 
-        # спліттер для середини
         center_splitter = QSplitter(Qt.Horizontal)
         left_panel = QWidget()
         lp = QVBoxLayout(left_panel)
@@ -256,18 +496,13 @@ class MatchAnalysisDialog(QDialog):
         center_splitter.setStretchFactor(0, 3)
         center_splitter.setStretchFactor(1, 2)
 
-        # --------------------------------------------------------
-        #                 НИЖНЯ ЧАСТИНА (ДВІ ВКЛАДКИ)
-        # --------------------------------------------------------
-
         self.bottom_tabs = QTabWidget()
         self.bottom_tabs.currentChanged.connect(self.on_bottom_tab_changed)
 
-        # --- вкладка ПІБ ---
+        # --- ПІБ вкладка ---
         pib_tab = QWidget()
         pib_layout = QVBoxLayout(pib_tab)
         pib_layout.setContentsMargins(0, 0, 0, 0)
-
         bottom_pib_splitter = QSplitter(Qt.Horizontal)
 
         match_panel_pib = QWidget()
@@ -296,14 +531,12 @@ class MatchAnalysisDialog(QDialog):
         bottom_pib_splitter.addWidget(unique_panel_pib)
         bottom_pib_splitter.setStretchFactor(0, 1)
         bottom_pib_splitter.setStretchFactor(1, 1)
-
         pib_layout.addWidget(bottom_pib_splitter)
 
-        # --- вкладка ОРС ---
+        # --- ОРС вкладка ---
         ors_tab = QWidget()
         ors_layout = QVBoxLayout(ors_tab)
         ors_layout.setContentsMargins(0, 0, 0, 0)
-
         bottom_ors_splitter = QSplitter(Qt.Horizontal)
 
         match_panel_ors = QWidget()
@@ -332,57 +565,30 @@ class MatchAnalysisDialog(QDialog):
         bottom_ors_splitter.addWidget(unique_panel_ors)
         bottom_ors_splitter.setStretchFactor(0, 1)
         bottom_ors_splitter.setStretchFactor(1, 1)
-
         ors_layout.addWidget(bottom_ors_splitter)
 
-        # додаємо вкладки внизу
         self.bottom_tabs.addTab(pib_tab, "ПІБ")
         self.bottom_tabs.addTab(ors_tab, "ОРС")
 
-        # --- сигнали для списків ---
-        self.list_matches_pib.itemSelectionChanged.connect(
-            lambda: self.on_match_selected("pib")
-        )
-        self.list_unique_pib.itemSelectionChanged.connect(
-            lambda: self.on_unique_selected("pib")
-        )
-        self.btn_export_unique_pib.clicked.connect(
-            lambda: self.export_unique_rows("pib")
-        )
+        self.list_matches_pib.itemSelectionChanged.connect(lambda: self.on_match_selected("pib"))
+        self.list_unique_pib.itemSelectionChanged.connect(lambda: self.on_unique_selected("pib"))
+        self.btn_export_unique_pib.clicked.connect(lambda: self.export_unique_rows("pib"))
+        self.btn_export_matches_pib.clicked.connect(lambda: self.export_matches_rows("pib"))
 
-        self.btn_export_matches_pib.clicked.connect(
-            lambda: self.export_matches_rows("pib")
-        )
+        self.list_matches_ors.itemSelectionChanged.connect(lambda: self.on_match_selected("ors"))
+        self.list_unique_ors.itemSelectionChanged.connect(lambda: self.on_unique_selected("ors"))
+        self.btn_export_unique_ors.clicked.connect(lambda: self.export_unique_rows("ors"))
+        self.btn_export_matches_ors.clicked.connect(lambda: self.export_matches_rows("ors"))
 
-        self.list_matches_ors.itemSelectionChanged.connect(
-            lambda: self.on_match_selected("ors")
-        )
-        self.list_unique_ors.itemSelectionChanged.connect(
-            lambda: self.on_unique_selected("ors")
-        )
-        self.btn_export_unique_ors.clicked.connect(
-            lambda: self.export_unique_rows("ors")
-        )
-
-        self.btn_export_matches_ors.clicked.connect(
-            lambda: self.export_matches_rows("ors")
-        )
-
-        # --------------------------------------------------------
-        #                   ГОЛОВНИЙ LAYOUT ДІАЛОГУ
-        # --------------------------------------------------------
         layout = QVBoxLayout(self)
         layout.addLayout(top)
         layout.addWidget(center_splitter, 3)
         layout.addWidget(self.bottom_tabs, 2)
 
-        # Якщо була таблиця з головного — вставляємо
         if self.current_df is not None:
             self.set_left_df(self.current_df)
 
-    # ============================================================
-    #                      ЛІВА ТАБЛИЦЯ
-    # ============================================================
+    # -------------------- ЛЕВАЯ ТАБЛИЦА --------------------
 
     def set_left_df(self, df: pd.DataFrame):
         self.left_df = df.copy()
@@ -390,9 +596,7 @@ class MatchAnalysisDialog(QDialog):
         self.left_table.setModel(model)
         self.left_table.horizontalHeader().setStretchLastSection(True)
 
-        self.btn_find_matches.setEnabled(
-            self.left_df is not None and len(self.right_text.strip()) > 0
-        )
+        self.btn_find_matches.setEnabled(self.left_df is not None and len(self.right_text.strip()) > 0)
 
     def use_current_table(self):
         if self.current_df is None:
@@ -401,41 +605,26 @@ class MatchAnalysisDialog(QDialog):
         self.set_left_df(self.current_df)
 
     def load_table_left(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Вибрати таблицю", "", "Таблиці (*.csv *.xlsx *.xls *.docx)"
-        )
+        path, _ = QFileDialog.getOpenFileName(self, "Вибрати таблицю", "", "Таблиці (*.csv *.xlsx *.xls *.docx)")
         if not path:
             return
-
         try:
             df = load_test_df(path)
             self.set_left_df(df)
         except Exception as e:
             QMessageBox.critical(self, "Помилка", str(e))
 
-    # ============================================================
-    # ДОПОМІЖНІ МЕТОДИ ДЛЯ УНІФІКАЦІЇ ПІБ ТА № ОРС
-    # ============================================================
+    # -------------------- ВСПОМОГАТЕЛЬНЫЕ --------------------
 
     def _get_pib_series(self) -> pd.Series | None:
-        """
-        Повертає серію з ПІБ для лівої таблиці.
-
-        1) Якщо є колонка з 'ПІБ' у назві – використовуємо її як є.
-        2) Якщо її немає – пробуємо зібрати ПІБ із колонок
-           'Прізвище' / 'Ім’я' / 'По батькові' (або схожих).
-        """
         if self.left_df is None:
             return None
-
         df = self.left_df
 
-        # 1) Колонка з ПІБ цілком
         pib_col = next((c for c in df.columns if "ПІБ" in str(c)), None)
         if pib_col is not None:
             return df[pib_col].astype(str)
 
-        # 2) Пробуємо знайти окремі колонки для ПІБ
         def find_col(substrings: list[str]) -> str | None:
             for col in df.columns:
                 name = str(col)
@@ -448,7 +637,6 @@ class MatchAnalysisDialog(QDialog):
         col_patron = find_col(["По батьков", "По-батьков", "По батькові", "По-батькові"])
 
         if not any([col_last, col_first, col_patron]):
-            # Взагалі немає колонок з ПІБ
             return None
 
         parts: list[pd.Series] = []
@@ -459,38 +647,19 @@ class MatchAnalysisDialog(QDialog):
         if col_patron:
             parts.append(df[col_patron].astype(str).str.strip())
 
-        # Склеюємо знайдені частини через пробіл
         result = parts[0]
         for ser in parts[1:]:
             result = result + " " + ser
 
-        result = result.str.replace(r"\s+", " ", regex=True).str.strip()
-        return result
+        return result.str.replace(r"\s+", " ", regex=True).str.strip()
 
     def _get_ors_series(self) -> pd.Series | None:
-        """
-        Повертає серію з № ОРС (або ОРД/РД) для лівої таблиці.
-
-        Логіка:
-        1) Якщо є явна колонка з назвою типу '№ ОРС', '№ОРС', 'ОРД. РД №' – беремо її.
-        2) Якщо ні – склеюємо весь рядок у один текст і шукаємо перший номер
-           з 5–10 цифр (регулярка).
-        """
         if self.left_df is None:
             return None
-
         df = self.left_df
 
         def find_ors_col() -> str | None:
-            candidates = [
-                "№ ОРС",
-                "№ОРС",
-                "№ОРД",
-                "ОРД. РД",
-                "ОРД РД",
-                "ОРД/РД",
-                "ОРС №",
-            ]
+            candidates = ["№ ОРС", "№ОРС", "№ОРД", "ОРД. РД", "ОРД РД", "ОРД/РД", "ОРС №"]
             for col in df.columns:
                 name = str(col)
                 if any(sub in name for sub in candidates):
@@ -501,28 +670,18 @@ class MatchAnalysisDialog(QDialog):
         if ors_col:
             base = df[ors_col].astype(str)
         else:
-            # Склеюємо весь рядок
             base = df.astype(str).agg(" ".join, axis=1)
 
-        # Витягуємо перший "пристойний" номер (5–10 цифр поспіль)
-        pattern = r"(\d{5,10})"
-        extracted = base.str.extract(pattern, expand=False)
-        extracted = extracted.fillna("")
-
+        extracted = base.str.extract(r"(\d{5,10})", expand=False).fillna("")
         if extracted.eq("").all():
             return None
-
         return extracted
 
-    # ============================================================
-    #                 ЗАВАНТАЖЕННЯ ДОКУМЕНТА СПРАВА
-    # ============================================================
+    # -------------------- ПРАВЫЙ ДОКУМЕНТ --------------------
 
     def load_right_document(self):
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Вибрати документ",
-            "",
+            self, "Вибрати документ", "",
             "Документи (*.docx *.txt *.csv *.xlsx);;Усі файли (*)"
         )
         if not path:
@@ -538,9 +697,7 @@ class MatchAnalysisDialog(QDialog):
 
             elif ext in (".csv", ".xlsx"):
                 if ext == ".csv":
-                    df = pd.read_csv(
-                        path, dtype=str, sep=None, engine="python"
-                    ).fillna("")
+                    df = pd.read_csv(path, dtype=str, sep=None, engine="python").fillna("")
                 else:
                     df = pd.read_excel(path, dtype=str).fillna("")
                 table = df
@@ -549,21 +706,15 @@ class MatchAnalysisDialog(QDialog):
 
             elif ext == ".docx":
                 doc = Document(path)
-
                 parts = []
-                # параграфи
                 for p in doc.paragraphs:
                     if p.text.strip():
                         parts.append(p.text)
 
-                # таблиці
                 rows_all = []
                 for t in doc.tables:
                     for r in t.rows:
-                        cells = [
-                            " ".join(p.text for p in c.paragraphs).strip()
-                            for c in r.cells
-                        ]
+                        cells = [" ".join(p.text for p in c.paragraphs).strip() for c in r.cells]
                         rows_all.append(cells)
                         row_text = " ".join(cells).strip()
                         if row_text:
@@ -572,9 +723,7 @@ class MatchAnalysisDialog(QDialog):
                 if rows_all:
                     maxc = max(len(r) for r in rows_all)
                     norm = [r + [""] * (maxc - len(r)) for r in rows_all]
-                    table = pd.DataFrame(
-                        norm, columns=[f"Col {i+1}" for i in range(maxc)]
-                    )
+                    table = pd.DataFrame(norm, columns=[f"Col {i+1}" for i in range(maxc)])
 
                 text = "\n".join(parts)
 
@@ -593,73 +742,45 @@ class MatchAnalysisDialog(QDialog):
                 self.right_table.setModel(None)
                 self.right_tabs.setTabEnabled(1, False)
 
-            self.btn_find_matches.setEnabled(
-                self.left_df is not None and bool(self.right_text.strip())
-            )
+            self.btn_find_matches.setEnabled(self.left_df is not None and bool(self.right_text.strip()))
 
         except Exception as e:
             QMessageBox.critical(self, "Помилка", str(e))
 
-    # ============================================================
-    #                      ОБРОБКА ВКЛАДОК ВНИЗУ
-    # ============================================================
+    # -------------------- ВКЛАДКИ НИЗУ --------------------
 
     def on_bottom_tab_changed(self, index: int):
         self.current_mode = "pib" if index == 0 else "ors"
 
-    # ============================================================
-    #                        ПОШУК ЗБІГІВ
-    # ============================================================
+    # -------------------- НОРМАЛИЗАЦИЯ (ИСПРАВЛЕНО) --------------------
 
-    def find_matches(self):
-        """
-        Запускає аналіз по обох режимах: ПІБ та ОРС.
-        """
-        if self.left_df is None or not self.right_text.strip():
-            QMessageBox.warning(self, "Помилка", "Потрібна таблиця зліва та документ справа.")
-            return
-
-        self._unique_pos_index.clear()
-
-        # --- ПІБ ---
-        self._find_pib_matches()
-
-        # --- ОРС ---
-        self._find_ors_matches()
-
-        # за замовчуванням показуємо вкладку ПІБ
-        self.bottom_tabs.setCurrentIndex(0)
-        self.current_mode = "pib"
-
-        # підсвічуємо всі збіги ПІБ у тексті
-        self.highlight_all_pib_matches()
-
-        if not self.pib_matches and not self.ors_matches:
-            QMessageBox.information(self, "Готово", "Збігів не знайдено.")
-
-    # --- внутрішній аналіз по ПІБ ---
+    def _extract_dob_safe(self, text: str) -> str:
+        """Витягує дату у форматі дд.мм.рррр. Повертає '' якщо немає."""
+        if text is None:
+            return ""
+        s = str(text).strip()
+        if not s or s in ("-", "—"):
+            return ""
+        m = re.search(r"\d{2}\.\d{2}\.\d{4}", s)
+        return m.group(0) if m else ""
 
     def _normalize_pib_flexible(self, value: str) -> str:
         """
-        Дуже гнучка нормалізація ПІБ для порівняння (тільки в цьому вікні):
-        - ігнорує апострофи/тире/пунктуацію
-        - прибирає невидимі символи та нестандартні пробіли
-        - вирівнює латиницю↔кирилицю для візуальних «двійників»
-        - не залежить від регістру
+        Гнучка нормалізація ПІБ:
+        - прибирає апострофи/тире/пунктуацію
+        - прибирає невидимі пробіли
+        - вирівнює латиницю↔кирилицю (візуальні двійники)
+        - casefold
         """
         if value is None:
             return ""
-
         s = str(value)
 
-        # Unicode нормалізація
         s = unicodedata.normalize("NFKC", s)
 
-        # невидимі/нестандартні пробіли
         for sp in ("\u00A0", "\u200B", "\u202F", "\ufeff"):
             s = s.replace(sp, " ")
 
-        # латинські «двійники» -> кирилиця
         s = s.translate(str.maketrans({
             "A": "А", "a": "а",
             "B": "В",
@@ -676,25 +797,36 @@ class MatchAnalysisDialog(QDialog):
             "Y": "У", "y": "у",
         }))
 
-        # прибираємо апострофи і тире повністю
         s = re.sub(r"[’ʼ'`´\-–—−‐]", "", s)
-
-        # прибираємо пунктуацію
         s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
-
-        # схлопуємо пробіли
         s = re.sub(r"\s+", " ", s).strip()
 
         return s.casefold()
 
     def _normalize_text_for_search(self, text: str) -> str:
-        """Нормалізація всього тексту документа для коректного пошуку."""
         return self._normalize_pib_flexible(text or "")
+
+    # -------------------- ПОИСК --------------------
+
+    def find_matches(self):
+        if self.left_df is None or not self.right_text.strip():
+            QMessageBox.warning(self, "Помилка", "Потрібна таблиця зліва та документ справа.")
+            return
+
+        self._unique_pos_index.clear()
+        self._find_pib_matches()
+        self._find_ors_matches()
+
+        self.bottom_tabs.setCurrentIndex(0)
+        self.current_mode = "pib"
+        self.highlight_all_pib_matches()
+
+        if not self.pib_matches and not self.ors_matches:
+            QMessageBox.information(self, "Готово", "Збігів не знайдено.")
 
     def _find_pib_matches(self):
         pib_series = self._get_pib_series()
 
-        # очищаємо вкладку ПІБ
         self.pib_matches = []
         self.pib_unique_rows = None
         self.list_matches_pib.clear()
@@ -705,8 +837,10 @@ class MatchAnalysisDialog(QDialog):
         if pib_series is None or self.left_df is None:
             return
 
-        # нормалізуємо ВЕСЬ текст документа один раз
-        norm_text = self._normalize_text_for_search(self.right_text)
+        dob_col = next((c for c in self.left_df.columns if "Дата народ" in str(c) or "Дата рожд" in str(c)), None)
+
+        raw_lines = [ln.strip() for ln in self.right_text.splitlines() if ln.strip()]
+        norm_lines = [self._normalize_text_for_search(ln) for ln in raw_lines]
 
         matched_idx: set[int] = set()
 
@@ -719,30 +853,44 @@ class MatchAnalysisDialog(QDialog):
             if not norm_name:
                 continue
 
-            if norm_name in norm_text:
-                count = norm_text.count(norm_name)
+            dob = ""
+            if dob_col and dob_col in self.left_df.columns:
+                dob = self._extract_dob_safe(self.left_df.at[idx, dob_col])
+
+            if not dob:
+                dob = self._extract_dob_safe(raw_name)
+
+            found_count = 0
+
+            if dob:
+                for norm_ln, raw_ln in zip(norm_lines, raw_lines):
+                    if norm_name in norm_ln and dob in raw_ln:
+                        found_count += 1
+            else:
+                for norm_ln in norm_lines:
+                    if norm_name in norm_ln:
+                        found_count += norm_ln.count(norm_name)
+
+            if found_count > 0:
                 self.pib_matches.append((idx, name))
-                self.list_matches_pib.addItem(f"{idx}: {name} ({count})")
+                if dob:
+                    self.list_matches_pib.addItem(f"{idx}: {name} | ДН: {dob} ({found_count})")
+                else:
+                    self.list_matches_pib.addItem(f"{idx}: {name} ({found_count})")
                 matched_idx.add(idx)
 
-        # унікальні рядки по ПІБ
         self.pib_unique_rows = self.left_df[~self.left_df.index.isin(matched_idx)].copy()
 
         for idx, raw_name in pib_series.items():
             if idx not in matched_idx:
                 self.list_unique_pib.addItem(f"{idx}: {raw_name}")
 
-        self.btn_export_unique_pib.setEnabled(
-            self.pib_unique_rows is not None and not self.pib_unique_rows.empty
-        )
+        self.btn_export_unique_pib.setEnabled(self.pib_unique_rows is not None and not self.pib_unique_rows.empty)
         self.btn_export_matches_pib.setEnabled(len(self.pib_matches) > 0)
-
-    # --- внутрішній аналіз по ОРС ---
 
     def _find_ors_matches(self):
         ors_series = self._get_ors_series()
 
-        # очищаємо вкладку ОРС
         self.ors_matches = []
         self.ors_unique_rows = None
         self.list_matches_ors.clear()
@@ -750,8 +898,7 @@ class MatchAnalysisDialog(QDialog):
         self.btn_export_unique_ors.setEnabled(False)
         self.btn_export_matches_ors.setEnabled(False)
 
-        if ors_series is None:
-            # взагалі не вдалось витягнути номери
+        if ors_series is None or self.left_df is None:
             return
 
         text_lower = self.right_text.lower()
@@ -774,18 +921,12 @@ class MatchAnalysisDialog(QDialog):
             if idx not in matched_idx:
                 self.list_unique_ors.addItem(f"{idx}: {raw_num}")
 
-        self.btn_export_unique_ors.setEnabled(
-            self.ors_unique_rows is not None and not self.ors_unique_rows.empty
-        )
-
+        self.btn_export_unique_ors.setEnabled(self.ors_unique_rows is not None and not self.ors_unique_rows.empty)
         self.btn_export_matches_ors.setEnabled(len(self.ors_matches) > 0)
 
-    # ============================================================
-    #            ПІДСВІЧЕННЯ ВСІХ ЗБІГІВ (ЛИШЕ ДЛЯ ПІБ)
-    # ============================================================
+    # -------------------- ПОДСВЕТКА --------------------
 
     def highlight_all_pib_matches(self):
-        """Жовте підсвічення всіх ПІБ, які знайдені у тексті."""
         doc = self.right_text_edit.document()
 
         cursor = QTextCursor(doc)
@@ -809,20 +950,13 @@ class MatchAnalysisDialog(QDialog):
                     break
                 cursor = QTextCursor(doc)
                 cursor.setPosition(pos)
-                cursor.movePosition(
-                    QTextCursor.Right, QTextCursor.KeepAnchor, len(name)
-                )
+                cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, len(name))
                 cursor.mergeCharFormat(fmt_yellow)
                 start = pos + len(name)
 
-    # ============================================================
-    #           ВИБІР ЗІ СПИСКУ ЗБІГІВ (ПІБ / ОРС)
-    # ============================================================
+    # -------------------- UI: выбор из списков --------------------
 
     def on_match_selected(self, mode: str):
-        """
-        mode: "pib" або "ors"
-        """
         if mode == "pib":
             item = self.list_matches_pib.currentItem()
             matches = self.pib_matches
@@ -841,32 +975,21 @@ class MatchAnalysisDialog(QDialog):
             if pos_brace != -1:
                 name = name[:pos_brace].strip()
 
-        # 1) прокрутка лівої таблиці
         model = self.left_table.model()
         if model and self.left_df is not None:
             for r in range(model.rowCount()):
                 if self.left_df.index[r] == idx:
-                    index = model.index(r, 0)
-                    self.left_table.scrollTo(index)
+                    qidx = model.index(r, 0)
+                    self.left_table.scrollTo(qidx)
                     self.left_table.selectRow(r)
                     break
 
-        # 2) прокрутка правого тексту
         self.scroll_to_in_text(name)
 
-        # 3) якщо справа є таблиця — підсвічуємо там
         if self.right_df is not None:
             self.highlight_in_right_table(name)
 
-    # ============================================================
-    #      ВИБІР УНІКАЛЬНОГО РЯДКА (ЦИКЛІЧНИЙ ПОШУК У ТЕКСТІ)
-    # ============================================================
-
     def on_unique_selected(self, mode: str):
-        """
-        Циклічний пошук унікального ПІБ / ОРС у документі
-        (м'яке фіолетове підсвічення по всіх вхождениях).
-        """
         if mode == "pib":
             item = self.list_unique_pib.currentItem()
         else:
@@ -875,15 +998,12 @@ class MatchAnalysisDialog(QDialog):
         if not item:
             return
 
-        # формат: "7: Дор Олена Степанівна, 11.12.1975..." або "7: 8925622 25.01.2024 ..."
         try:
             _, full_text = item.text().split(":", 1)
             full_text = full_text.strip()
         except ValueError:
             return
 
-        # для ПІБ беремо ПІБ до першої коми, для ОРС — перше число або весь текст
-        import re
         if mode == "pib":
             name = full_text.split(",")[0].strip()
         else:
@@ -896,7 +1016,6 @@ class MatchAnalysisDialog(QDialog):
         name_lower = name.lower()
         text_lower = self.right_text.lower()
 
-        # всі вхождения
         positions = []
         start = 0
         while True:
@@ -907,11 +1026,7 @@ class MatchAnalysisDialog(QDialog):
             start = pos + len(name)
 
         if not positions:
-            QMessageBox.information(
-                self,
-                "Немає вхождень",
-                f"У документі не знайдено:\n{name}",
-            )
+            QMessageBox.information(self, "Немає вхождень", f"У документі не знайдено:\n{name}")
             return
 
         key = (mode, name_lower)
@@ -921,13 +1036,11 @@ class MatchAnalysisDialog(QDialog):
         self._unique_pos_index[key] = cur_idx
         pos = positions[cur_idx]
 
-        # очищуємо форматування
         doc = self.right_text_edit.document()
         cursor = QTextCursor(doc)
         cursor.select(QTextCursor.Document)
         cursor.setCharFormat(QTextCharFormat())
 
-        # фіолетове підсвічення
         fmt = QTextCharFormat()
         fmt.setBackground(QColor("#d9b3ff"))
 
@@ -939,8 +1052,6 @@ class MatchAnalysisDialog(QDialog):
         self.right_text_edit.setTextCursor(cursor)
         self.right_text_edit.ensureCursorVisible()
 
-    # ------------------------------------------------------------
-
     def scroll_to_in_text(self, name: str):
         if not self.right_text:
             return
@@ -951,14 +1062,11 @@ class MatchAnalysisDialog(QDialog):
         if pos == -1:
             return
 
-        # для ПІБ повертаємо жовті підсвічення
         self.highlight_all_pib_matches()
 
         cursor = self.right_text_edit.textCursor()
         cursor.setPosition(pos)
-        cursor.movePosition(
-            QTextCursor.Right, QTextCursor.KeepAnchor, len(name)
-        )
+        cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, len(name))
 
         fmt_sel = QTextCharFormat()
         fmt_sel.setBackground(Qt.lightGray)
@@ -971,7 +1079,6 @@ class MatchAnalysisDialog(QDialog):
         model = self.right_table.model()
         if model is None:
             return
-
         name_lower = name.lower()
         for r in range(model.rowCount()):
             for c in range(model.columnCount()):
@@ -981,12 +1088,9 @@ class MatchAnalysisDialog(QDialog):
                     self.right_table.scrollTo(model.index(r, 0))
                     return
 
-    # ============================================================
-    #                       ЕКСПОРТ УНІКАЛЬНИХ
-    # ============================================================
+    # -------------------- экспорт --------------------
 
     def _format_df_for_export(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Форматування як у головному вікні: без service-колонок + нормальні дати/булі."""
         out = df.copy()
         for c in SERVICE_COLS:
             if c in out.columns:
@@ -1004,10 +1108,7 @@ class MatchAnalysisDialog(QDialog):
             return
 
         path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            title,
-            "",
-            "Word (*.docx);;Excel (*.xlsx);;CSV (*.csv)",
+            self, title, "", "Word (*.docx);;Excel (*.xlsx);;CSV (*.csv)"
         )
         if not path:
             return
@@ -1017,8 +1118,6 @@ class MatchAnalysisDialog(QDialog):
 
             if path.lower().endswith(".docx") or "Word" in selected_filter:
                 doc = Document()
-
-                # Альбомна орієнтація
                 section = doc.sections[0]
                 section.orientation = WD_ORIENT.LANDSCAPE
                 new_width, new_height = section.page_height, section.page_width
@@ -1050,11 +1149,7 @@ class MatchAnalysisDialog(QDialog):
             QMessageBox.critical(self, "Помилка", str(e))
 
     def export_unique_rows(self, mode: str):
-        if mode == "pib":
-            unique_rows = self.pib_unique_rows
-        else:
-            unique_rows = self.ors_unique_rows
-
+        unique_rows = self.pib_unique_rows if mode == "pib" else self.ors_unique_rows
         self._export_df(unique_rows, "Зберегти унікальні рядки")
 
     def export_matches_rows(self, mode: str):
@@ -1062,16 +1157,11 @@ class MatchAnalysisDialog(QDialog):
             QMessageBox.information(self, "Немає даних", "Немає лівої таблиці.")
             return
 
-        if mode == "pib":
-            indices = [idx for idx, _ in self.pib_matches]
-        else:
-            indices = [idx for idx, _ in self.ors_matches]
-
+        indices = [idx for idx, _ in (self.pib_matches if mode == "pib" else self.ors_matches)]
         if not indices:
             QMessageBox.information(self, "Немає даних", "Немає збігів для експорту.")
             return
 
-        # На випадок повторів — унікалізуємо, але порядок зберігаємо
         seen = set()
         ordered = []
         for i in indices:
@@ -1079,9 +1169,9 @@ class MatchAnalysisDialog(QDialog):
                 seen.add(i)
                 ordered.append(i)
 
-        # .loc зберігає порядок списку `ordered`
         df_matches = self.left_df.loc[ordered].copy()
         self._export_df(df_matches, "Зберегти збіги")
+
 
 # ============================================================
 #                      ГОЛОВНЕ ВІКНО
@@ -1100,52 +1190,32 @@ class MainWindow(QMainWindow):
         self.conditions: list[FilterCondition] = []
         self.global_search_text: str = ""
 
-        # ----- маркери станів рядків / клітинок -----
-        # повністю червоні рядки (прострочений строк за 5-ю колонкою)
         self.expired_indices: Set[Any] = set()
-
-        # жовта КЛІТИНКА в 5-й колонці (до прострочення ≤ 10 діб)
         self.expiring_by5_indices: Set[Any] = set()
-
-        # попередження по ОРС (жовті клітинки в 7–8 колонках, до 20 діб)
         self.ors_warning_indices: Set[Any] = set()
-
-        # прострочені по ОРС (червоні клітинки в 7–8 колонках, >20 діб)
         self.ors_overdue_indices: Set[Any] = set()
-
-        # дублікати ПІБ (сині рядки)
         self.duplicate_indices: Set[Any] = set()
 
-        # для пояснюючих попапів — зберігаємо ще окремо ряди по ОРС
         self.ors_warning_rows: Set[Any] = set()
         self.ors_overdue_rows: Set[Any] = set()
 
-        # імена ключових колонок (передаємо в модель для точкової підсвітки)
         self.col5_name: str | None = None
         self.col7_name: str | None = None
         self.col8_name: str | None = None
 
-        # поточний режим перегляду:
-        # main / archive / deleted / expired / ors_warning / ors_overdue
         self.view_mode: str = "main"
-
         self.current_file_path: str | None = None
+
+        self.show_only_expiring = False  # чтобы не падало, даже если не используешь
 
         self._init_ui()
         self._load_last_state_or_file()
-
-    # --------------------------------------------------------
-    #                    ІНІЦІАЛІЗАЦІЯ UI
-    # --------------------------------------------------------
 
     def _init_ui(self):
         central = QWidget()
         root = QVBoxLayout(central)
         root.setContentsMargins(5, 5, 5, 5)
 
-        # ----------------------------------------------------
-        # Верхня панель
-        # ----------------------------------------------------
         top = QHBoxLayout()
 
         self.btn_load = QPushButton("📂 Відкрити")
@@ -1176,7 +1246,6 @@ class MainWindow(QMainWindow):
         self.ed_search.setEnabled(False)
         top.addWidget(self.ed_search, stretch=2)
 
-        # Вкладки режимів перегляду
         self.tab_mode = QTabWidget()
         self.tab_mode.addTab(QWidget(), "Основні")
         self.tab_mode.addTab(QWidget(), "Архів")
@@ -1190,12 +1259,8 @@ class MainWindow(QMainWindow):
 
         root.addLayout(top)
 
-        # ----------------------------------------------------
-        # Центральна частина — QSplitter
-        # ----------------------------------------------------
         main_splitter = QSplitter(Qt.Horizontal)
 
-        # Ліва панель
         left = QVBoxLayout()
         left.setAlignment(Qt.AlignTop)
 
@@ -1299,16 +1364,13 @@ class MainWindow(QMainWindow):
         self.btn_restore_rows.setEnabled(False)
         left.addWidget(self.btn_restore_rows)
 
-        self.list_conditions.itemDoubleClicked.connect(
-            lambda _: self.remove_selected_condition()
-        )
+        self.list_conditions.itemDoubleClicked.connect(lambda _: self.remove_selected_condition())
 
         left_widget = QWidget()
         left_widget.setLayout(left)
         left_widget.setMinimumWidth(260)
         left_widget.setMaximumWidth(380)
 
-        # Таблиця справа
         self.table_view = QTableView()
         self.table_view.setAlternatingRowColors(True)
         self.table_view.horizontalHeader().setStretchLastSection(True)
@@ -1317,15 +1379,11 @@ class MainWindow(QMainWindow):
 
         main_splitter.addWidget(left_widget)
         main_splitter.addWidget(self.table_view)
-
         main_splitter.setStretchFactor(0, 0)
         main_splitter.setStretchFactor(1, 1)
 
         root.addWidget(main_splitter)
 
-        # ----------------------------------------------------
-        # Нижня панель (легенда + лого)
-        # ----------------------------------------------------
         bottom_bar = QHBoxLayout()
         bottom_bar.setContentsMargins(4, 2, 4, 2)
         bottom_bar.setSpacing(6)
@@ -1360,14 +1418,7 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-    # ======================================================================
-    #  ВСПЛЫВАЮЩЕЕ ОКНО: ЛЕГЕНДА ЦВЕТОВ ТАБЛИЦЫ
-    # ======================================================================
     def show_colors_legend(self):
-        """
-        Открывает всплывающее окно с описанием цветовой схемы,
-        используемой в основной таблице.
-        """
         QMessageBox.information(
             self,
             "Легенда кольорів",
@@ -1379,15 +1430,9 @@ class MainWindow(QMainWindow):
             "Архів – зелений фон всього рядка\n"
         )
 
-    # --------------------------------------------------------
-    #                    ДОПОМІЖНІ МЕТОДИ
-    # --------------------------------------------------------
-    
+    # -------------------- helpers --------------------
 
     def _is_date_like_column(self, series: pd.Series) -> bool:
-        """
-        Визначає, чи можна вважати стовпець "датоподібним".
-        """
         if pd.api.types.is_datetime64_any_dtype(series):
             return True
         try:
@@ -1397,10 +1442,7 @@ class MainWindow(QMainWindow):
 
     def _save_last_file(self, path: str):
         try:
-            CONFIG_PATH.write_text(
-                json.dumps({"last_file": path}, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            CONFIG_PATH.write_text(json.dumps({"last_file": path}, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
 
@@ -1413,7 +1455,6 @@ class MainWindow(QMainWindow):
             pass
 
     def _load_last_state_or_file(self):
-        # Спочатку пробуємо підняти стан з pickle
         if STATE_PATH.exists():
             try:
                 df = pd.read_pickle(STATE_PATH)
@@ -1423,7 +1464,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        # Якщо стану немає — пробуємо останній файл
         if not CONFIG_PATH.exists():
             return
         try:
@@ -1434,16 +1474,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    # --------------------------------------------------------
-    #      ЄДИНЕ місце, де ми ініціалізуємо df в UI
-    # --------------------------------------------------------
-
     def _setup_dataframe(self, df: pd.DataFrame, show_message: bool):
-        """Загальна логіка прив'язки DataFrame до UI."""
         self.df_original = df
         self.df_current = df.copy()
 
-        # Перерахунок строків, дублікатів, прострочених
         self.recalc_expiring_and_expired(show_popup=show_message)
         self.recalc_duplicate_marks(show_popup=show_message)
 
@@ -1462,27 +1496,16 @@ class MainWindow(QMainWindow):
         self.table_view.setModel(model)
         self.hide_service_columns()
 
-        # Прокуратури
         self.cb_prosecutor.setEnabled(True)
-
-        # чтобы при перезаполнении не срабатывал currentIndexChanged
         self.cb_prosecutor.blockSignals(True)
         self.cb_prosecutor.clear()
         self.cb_prosecutor.addItem("Усі прокуратури")
         if "Прокуратура" in df.columns:
             for p in sorted(df["Прокуратура"].dropna().unique()):
                 self.cb_prosecutor.addItem(str(p))
-
-        # ЯВНО сбрасываем выбор на "Усі прокуратури"
-        self.cb_prosecutor.setCurrentIndex(0)
-        self.cb_prosecutor.blockSignals(False)
-        
-        # завжди скидаємо фільтр на "Усі прокуратури"
-        self.cb_prosecutor.blockSignals(True)
         self.cb_prosecutor.setCurrentIndex(0)
         self.cb_prosecutor.blockSignals(False)
 
-        # Стовпці (без службових)
         self.cb_column.setEnabled(True)
         self.cb_column.clear()
         for col in df.columns:
@@ -1501,31 +1524,24 @@ class MainWindow(QMainWindow):
         self.ed_search.setEnabled(True)
         self.btn_check_duplicates.setEnabled(True)
 
-        # сбрасываем условия и поисковые поля
         self.conditions.clear()
         self.list_conditions.clear()
         self.global_search_text = ""
         self.ed_search.clear()
 
-        # режим просмотра — главное окно
         self.view_mode = "main"
         self.tab_mode.setCurrentIndex(0)
         self.update_action_buttons_state()
 
         self.on_column_changed(self.cb_column.currentIndex())
 
-        # сохраняем состояние
         self._save_state()
 
-    # --------------------------------------------------------
-    #                    ЗАВАНТАЖЕННЯ ТАБЛИЦІ
-    # --------------------------------------------------------
+    # -------------------- загрузка --------------------
 
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Вибрати файл реєстру",
-            "",
+            self, "Вибрати файл реєстру", "",
             "Таблиці (*.csv *.xlsx *.xls *.docx);;Усі файли (*)"
         )
         if not path:
@@ -1536,7 +1552,6 @@ class MainWindow(QMainWindow):
         try:
             df = load_test_df(path)
 
-            # Службові колонки
             if "is_archived" not in df.columns:
                 df["is_archived"] = False
             if "is_deleted" not in df.columns:
@@ -1562,27 +1577,9 @@ class MainWindow(QMainWindow):
                 idx = df.columns.get_loc(name)
                 self.table_view.setColumnHidden(idx, True)
 
-    # --------------------------------------------------------
-    #      ПЕРЕРАХУНОК СТРОКІВ, ЩО СПЛИВАЮТЬ ТА ПРОСТРОЧЕНИХ
-    # --------------------------------------------------------
+    # -------------------- пересчет сроков --------------------
 
     def recalc_expiring_and_expired(self, show_popup: bool = True):
-        """
-        Новая логика:
-
-        5-я колонка ("Запобіжний захід ..."):
-            • Берём первую дату (ВІД) -> +6 месяцев = дата закінчення.
-            • Учитываем только те сроки, дата закінчення яких >= 01.09.2025.
-            • Якщо до закінчення строку <= 10 діб -> жовта КЛІТИНКА (тільки 5-та колонка).
-            • Якщо строк вже минув -> ЧЕРВОНИЙ ВЕСЬ РЯДОК.
-
-        7–8 колонка ("Дата та вихідний № доручення" + "№ ОРС, дата заведення"):
-            • Якщо у 7-й є дата, але у 8-й НЕМає:
-                - 0..20 діб від дати у 7-й -> жовті клітинки в 7-й та 8-й.
-                - >20 діб -> червоні клітинки в 7-й та 8-й.
-            • Якщо у 7-й немає дати -> рядок не бере участі у цій перевірці.
-        """
-        # сбрасываем всё
         self.expired_indices = set()
         self.expiring_by5_indices = set()
         self.ors_warning_indices = set()
@@ -1595,122 +1592,72 @@ class MainWindow(QMainWindow):
 
         df = self.df_original
         today = pd.Timestamp.today().normalize()
-        cutoff_5 = pd.Timestamp(2025, 9, 1)   # прострочки враховуємо тільки ПІСЛЯ 09.2025
+        cutoff_5 = pd.Timestamp(2025, 9, 1)
 
-        # ---- шукаємо потрібні колонки ----
         self.col5_name = next((c for c in df.columns if "Запобіжний захід" in str(c)), None)
-
-        # БАЗОВА дата для ОРС – саме доручення (7-а колонка)
         self.col7_name = next(
-            (
-                c
-                for c in df.columns
-                if "Дата та вихідний № доручення" in str(c)
-                or ("доручення" in str(c) and "вихідний" in str(c))
-            ),
+            (c for c in df.columns if "Дата та вихідний № доручення" in str(c) or ("доручення" in str(c) and "вихідний" in str(c))),
             None,
         )
+        self.col8_name = next((c for c in df.columns if "№ ОРС" in str(c)), None)
 
-        self.col8_name = next(
-            (c for c in df.columns if "№ ОРС" in str(c)),
-            None,
-        )
-
-        # ------------------------------------------------
-        # 1) 5-та колонка — строк запобіжного заходу
-        # ------------------------------------------------
         if self.col5_name:
             ser5 = df[self.col5_name].astype(str)
-
-            # берем первую дату (ВІД)
             first_dates_str = ser5.str.extract(r"(\d{2}\.\d{2}\.\d{4})")[0]
             dates5 = pd.to_datetime(first_dates_str, format="%d.%m.%Y", errors="coerce")
-
             expiry_dates = dates5 + pd.DateOffset(months=6)
 
             for idx in df.index:
                 d_exp = expiry_dates.loc[idx]
                 if pd.isna(d_exp):
                     continue
-
-                # игнорируем все, что заканчивается до 01.09.2025
                 if d_exp < cutoff_5:
                     continue
-
                 days_left = (d_exp - today).days
-
                 if days_left < 0:
-                    # строк уже прошёл → красный ряд
                     self.expired_indices.add(idx)
                 elif 0 <= days_left <= 10:
-                    # 10 діб до прострочки → жёлтая клетка в 5-й
                     self.expiring_by5_indices.add(idx)
 
-        # ------------------------------------------------
-        # 2) 7–8 колонки — "не заведено ОРС"
-        # ------------------------------------------------
         if self.col7_name and self.col8_name:
             ser7 = df[self.col7_name].astype(str)
             ser8 = df[self.col8_name].astype(str)
 
-            d7 = ser7.str.extract(r"(\d{2}\.\d{2}\.\d{4})")[0]
-            d7 = pd.to_datetime(d7, format="%d.%m.%Y", errors="coerce")
-
-            d8 = ser8.str.extract(r"(\d{2}\.\d{2}\.\d{4})")[0]
-            d8 = pd.to_datetime(d8, format="%d.%m.%Y", errors="coerce")
+            d7 = pd.to_datetime(ser7.str.extract(r"(\d{2}\.\d{2}\.\d{4})")[0], format="%d.%m.%Y", errors="coerce")
+            d8 = pd.to_datetime(ser8.str.extract(r"(\d{2}\.\d{2}\.\d{4})")[0], format="%d.%m.%Y", errors="coerce")
 
             for idx in df.index:
                 base_date = d7.loc[idx]
                 ors_date = d8.loc[idx]
-
-                # если в 7-й нет даты — строка не участвует
                 if pd.isna(base_date):
                     continue
-
-                # если в 8-й уже есть дата — всё ок
                 if not pd.isna(ors_date):
                     continue
 
                 days_passed = (today - base_date).days
-
                 if 0 <= days_passed <= 20:
-                    # жёлтые 7 и 8
                     self.ors_warning_indices.add(idx)
                     self.ors_warning_rows.add(idx)
                 elif days_passed > 20:
-                    # красные 7 и 8
                     self.ors_overdue_indices.add(idx)
                     self.ors_overdue_rows.add(idx)
 
-        # ------------------------------------------------
-        # 3) Попап з коротким резюме
-        # ------------------------------------------------
         if show_popup:
             parts = []
             if self.expired_indices:
                 parts.append(f"Прострочені строки (5-та колонка): {len(self.expired_indices)}")
             if self.expiring_by5_indices:
-                parts.append(
-                    f"Строки, що спливають (≤10 діб, 5-та колонка): {len(self.expiring_by5_indices)}"
-                )
+                parts.append(f"Строки, що спливають (≤10 діб, 5-та колонка): {len(self.expiring_by5_indices)}")
             if self.ors_warning_rows:
                 parts.append(f"Не заведено ОРС (до 20 діб): {len(self.ors_warning_rows)}")
             if self.ors_overdue_rows:
                 parts.append(f"Не заведено ОРС (прострочено): {len(self.ors_overdue_rows)}")
-
             if parts:
                 QMessageBox.warning(self, "Увага", "\n".join(parts))
 
-    # --------------------------------------------------------
-    #                Пошук дублікатів (ПІБ)
-    # --------------------------------------------------------
+    # -------------------- дубликаты --------------------
 
     def recalc_duplicate_marks(self, show_popup: bool = True):
-        """
-        Дублікати шукаємо за повним збігом ПІБ (частина до першої коми).
-        ВАЖЛИВО: рахуємо тільки серед рядків, які НЕ видалені (is_deleted == False).
-        Тому якщо один із дублікатів пішов у 'Видалені', другий перестає бути дублікатом.
-        """
         old_count = len(self.duplicate_indices)
         self.duplicate_indices = set()
 
@@ -1730,7 +1677,6 @@ class MainWindow(QMainWindow):
 
         full_series = df[pib_col].astype(str)
         name_series = full_series.str.split(",", n=1).str[0].str.strip()
-
         valid = name_series != ""
         name_valid = name_series[valid]
         if name_valid.empty:
@@ -1746,24 +1692,13 @@ class MainWindow(QMainWindow):
         self.duplicate_indices.update(idxs)
 
         if show_popup and len(self.duplicate_indices) > old_count:
-            QMessageBox.warning(
-                self,
-                "Дублікати",
-                f"Виявлено {len(self.duplicate_indices)} запис(ів)-дублікат(ів) "
-                f"(за ПІБ).",
-            )
+            QMessageBox.warning(self, "Дублікати", f"Виявлено {len(self.duplicate_indices)} запис(ів)-дублікат(ів) (за ПІБ).")
 
-    # --------------------------------------------------------
-    #                   ГЛОБАЛЬНИЙ ПОШУК
-    # --------------------------------------------------------
+    # -------------------- поиск/фильтры --------------------
 
     def on_global_search(self, text: str):
         self.global_search_text = text.strip()
         self.apply_all_filters()
-
-    # --------------------------------------------------------
-    #           ПЕРЕМИКАННЯ РЕЖИМУ ВВЕДЕННЯ ДЛЯ СТОВПЦІВ
-    # --------------------------------------------------------
 
     def on_column_changed(self, index: int):
         if self.df_original is None or index < 0:
@@ -1782,12 +1717,8 @@ class MainWindow(QMainWindow):
         if is_date_like:
             self.ed_date_from.setVisible(True)
             self.ed_date_to.setVisible(True)
-            self.ed_date_from.setPlaceholderText(
-                "з дд.мм.рррр (можна не заповнювати)"
-            )
-            self.ed_date_to.setPlaceholderText(
-                "по дд.мм.рррр (можна не заповнювати)"
-            )
+            self.ed_date_from.setPlaceholderText("з дд.мм.рррр (можна не заповнювати)")
+            self.ed_date_to.setPlaceholderText("по дд.мм.рррр (можна не заповнювати)")
         else:
             self.ed_date_from.setVisible(False)
             self.ed_date_to.setVisible(False)
@@ -1795,7 +1726,6 @@ class MainWindow(QMainWindow):
         self.ed_date_from.clear()
         self.ed_date_to.clear()
 
-        # Випадаючий список можливих значень
         uniques = series.dropna().unique()
         if len(uniques) <= 50 or column in ("Стаття_ККУ", "Категорія_розшуку"):
             self.cb_value_choices.setVisible(True)
@@ -1809,12 +1739,7 @@ class MainWindow(QMainWindow):
     def on_value_choice_selected(self, index: int):
         if index <= 0:
             return
-        text = self.cb_value_choices.currentText()
-        self.ed_value.setText(text)
-
-    # --------------------------------------------------------
-    #                 ДОДАВАННЯ УМОВ ФІЛЬТРУ
-    # --------------------------------------------------------
+        self.ed_value.setText(self.cb_value_choices.currentText())
 
     def add_condition_from_ui(self):
         if self.df_original is None:
@@ -1827,11 +1752,9 @@ class MainWindow(QMainWindow):
         series = self.df_original[column]
         is_date_like = self._is_date_like_column(series)
 
-        # --------- діапазон дат ---------
         if is_date_like:
             from_text = self.ed_date_from.text().strip()
             to_text = self.ed_date_to.text().strip()
-
             if from_text or to_text:
                 def parse_date(txt: str):
                     if not txt:
@@ -1839,11 +1762,7 @@ class MainWindow(QMainWindow):
                     try:
                         return pd.to_datetime(txt, format="%d.%m.%Y", dayfirst=True)
                     except Exception:
-                        QMessageBox.warning(
-                            self,
-                            "Невірний формат дати",
-                            "Використовуйте формат дд.мм.рррр (наприклад, 05.01.2025).",
-                        )
+                        QMessageBox.warning(self, "Невірний формат дати", "Використовуйте формат дд.мм.рррр (наприклад, 05.01.2025).")
                         raise
 
                 try:
@@ -1852,11 +1771,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     return
 
-                cond = FilterCondition(
-                    column=column,
-                    operator=Operator.RANGE,
-                    value=(d_from, d_to),
-                )
+                cond = FilterCondition(column=column, operator=Operator.RANGE, value=(d_from, d_to))
                 self.conditions.append(cond)
 
                 label_from = from_text or "…"
@@ -1868,7 +1783,6 @@ class MainWindow(QMainWindow):
                 self.apply_all_filters()
                 return
 
-        # --------- текстовий фільтр ---------
         op_text = self.cb_operator.currentText()
         raw_value = self.ed_value.text().strip()
         if not op_text or not raw_value:
@@ -1881,26 +1795,7 @@ class MainWindow(QMainWindow):
         else:
             operator = Operator.NOT_EQUALS
 
-        value: Any = raw_value
-
-        try:
-            if pd.api.types.is_bool_dtype(series):
-                v = raw_value.lower()
-                if v in ("так", "true", "1"):
-                    value = True
-                elif v in ("ні", "false", "0", "нет", "no"):
-                    value = False
-            elif pd.api.types.is_datetime64_any_dtype(series):
-                value = pd.to_datetime(raw_value, format="%d.%m.%Y", dayfirst=True)
-            elif pd.api.types.is_numeric_dtype(series):
-                try:
-                    value = int(raw_value)
-                except ValueError:
-                    value = float(raw_value)
-        except Exception:
-            value = raw_value
-
-        cond = FilterCondition(column=column, operator=operator, value=value)
+        cond = FilterCondition(column=column, operator=operator, value=raw_value)
         self.conditions.append(cond)
         self.list_conditions.addItem(f"{column} {op_text} {raw_value}")
 
@@ -1920,10 +1815,6 @@ class MainWindow(QMainWindow):
         self.list_conditions.clear()
         self.apply_all_filters()
 
-    # --------------------------------------------------------
-    #                   Вкладки (режим перегляду)
-    # --------------------------------------------------------
-
     def on_tab_changed(self, index: int):
         if index == 0:
             self.view_mode = "main"
@@ -1932,11 +1823,11 @@ class MainWindow(QMainWindow):
         elif index == 2:
             self.view_mode = "deleted"
         elif index == 3:
-            self.view_mode = "expired"       # по 5-й колонке
+            self.view_mode = "expired"
         elif index == 4:
-            self.view_mode = "ors_warning"   # 7–8 колонки, до 20 діб
+            self.view_mode = "ors_warning"
         else:
-            self.view_mode = "ors_overdue"   # 7–8 колонки, прострочено
+            self.view_mode = "ors_overdue"
 
         self.update_action_buttons_state()
         self.apply_all_filters()
@@ -1958,16 +1849,10 @@ class MainWindow(QMainWindow):
             self.btn_delete_rows.setEnabled(False)
             self.btn_restore_rows.setEnabled(True)
         else:
-            # expired / ors_warning / ors_overdue —
-            # даём полный доступ к операциям
             self.btn_to_archive.setEnabled(True)
             self.btn_from_archive.setEnabled(True)
             self.btn_delete_rows.setEnabled(True)
             self.btn_restore_rows.setEnabled(True)
-
-    # --------------------------------------------------------
-    #                  ЗАСТОСУВАННЯ ФІЛЬТРІВ
-    # --------------------------------------------------------
 
     def apply_all_filters(self):
         if self.df_original is None:
@@ -1975,25 +1860,18 @@ class MainWindow(QMainWindow):
 
         df = self.df_original.copy()
 
-        # 1) умови
         if self.conditions:
             df = apply_filters(df, self.conditions)
 
-        # 2) прокуратура
         pros = self.cb_prosecutor.currentText()
         if pros and pros != "Усі прокуратури" and "Прокуратура" in df.columns:
             df = df[df["Прокуратура"] == pros]
 
-        # 3) глобальний пошук
         if self.global_search_text:
             text = self.global_search_text
-            mask = df.apply(
-                lambda col: col.astype(str).str.contains(text, case=False, na=False),
-                axis=0
-            ).any(axis=1)
+            mask = df.apply(lambda col: col.astype(str).str.contains(text, case=False, na=False), axis=0).any(axis=1)
             df = df[mask]
 
-        # 4) режим перегляду
         if "is_deleted" in df.columns:
             if self.view_mode == "main":
                 df = df[df["is_deleted"] == False]
@@ -2024,26 +1902,11 @@ class MainWindow(QMainWindow):
                 col8_name=self.col8_name,
             )
         else:
-            self.table_view.setModel(
-                PandasTableModel(
-                    self.df_current,
-                    edit_callback=self.on_cell_edited,
-                    expiring_by5_indices=self.expiring_by5_indices,
-                    expired_indices=self.expired_indices,
-                    duplicate_indices=self.duplicate_indices,
-                    ors_warning_indices=self.ors_warning_indices,
-                    ors_overdue_indices=self.ors_overdue_indices,
-                    col5_name=self.col5_name,
-                    col7_name=self.col7_name,
-                    col8_name=self.col8_name,
-                )
-            )
+            self.table_view.setModel(PandasTableModel(self.df_current, edit_callback=self.on_cell_edited))
 
         self.hide_service_columns()
 
-    # --------------------------------------------------------
-    #            СИНХРОНІЗАЦІЯ ПРАВОК У ТАБЛИЦІ
-    # --------------------------------------------------------
+    # -------------------- синхронизация правок --------------------
 
     def on_cell_edited(self, orig_index, column_name: str, new_value):
         if self.df_original is None:
@@ -2051,7 +1914,6 @@ class MainWindow(QMainWindow):
         if orig_index in self.df_original.index and column_name in self.df_original.columns:
             self.df_original.at[orig_index, column_name] = new_value
 
-        # Перерахунок строків та дублікатів, коли змінюються суттєві поля
         if column_name not in ("is_archived", "is_deleted"):
             self.recalc_expiring_and_expired(show_popup=False)
             self.recalc_duplicate_marks(show_popup=False)
@@ -2059,19 +1921,12 @@ class MainWindow(QMainWindow):
         self._save_state()
         self.apply_all_filters()
 
-    # --------------------------------------------------------
-    #                  РОБОТА З ВИДІЛЕННЯМ
-    # --------------------------------------------------------
+    # -------------------- выделение --------------------
 
     def get_selected_indices(self) -> list[int]:
-        """
-        Повертає індекси рядків, обраних користувачем через виділення в таблиці.
-        """
         if self.df_current is None:
             return []
-
         indices: set[int] = set()
-
         sel_model = self.table_view.selectionModel()
         if sel_model is not None:
             for idx in sel_model.selectedRows():
@@ -2080,18 +1935,14 @@ class MainWindow(QMainWindow):
                     indices.add(orig_index)
                 except Exception:
                     continue
-
         return list(indices)
 
-    # --------------------------------------------------------
-    #                     ДОДАВАННЯ РЯДКА
-    # --------------------------------------------------------
+    # -------------------- добавление --------------------
 
     def add_row(self):
         if self.df_original is None:
             return
 
-        # прокуратури для списку
         if "Прокуратура" in self.df_original.columns:
             prosecutors = sorted(self.df_original["Прокуратура"].dropna().unique())
         else:
@@ -2109,7 +1960,6 @@ class MainWindow(QMainWindow):
         notice_date = data["notice_date"]
         pib_block = ", ".join([v for v in [pib, dob, notice_date] if v])
 
-        # новий ID, якщо колонка є
         new_id = None
         if "ID" in cols:
             try:
@@ -2121,46 +1971,33 @@ class MainWindow(QMainWindow):
                 new_id = len(self.df_original) + 1
 
         row: dict[str, object] = {}
-
         for col in cols:
             text_col = str(col)
 
             if col == "ID" and new_id is not None:
                 row[col] = new_id
-
             elif text_col == "Прокуратура":
                 row[col] = data["prosecutor"]
-
             elif "№ кримінального провадження" in text_col:
                 row[col] = data["case_info"]
-
             elif text_col.strip() == "Фабула":
                 row[col] = data["fabula"]
-
             elif "ПІБ підозрюваного" in text_col:
                 row[col] = pib_block
-
             elif "Запобіжний захід" in text_col:
                 row[col] = data["measure"]
-
             elif "Підстава, дата зупинення" in text_col:
                 row[col] = data["stop_info"]
-
             elif "Дата та вихідний № доручення" in text_col:
                 row[col] = data["order_info"]
-
             elif "№ ОРС, дата заведення" in text_col:
                 row[col] = data["ors_info"]
-
             elif "Наявність інформації про перетин кордону" in text_col:
                 row[col] = data["border_info"]
-
             elif "Притягнення до адмін" in text_col:
                 row[col] = data["admin_info"]
-
             elif "Дата оголошення у міжнародний розшук" in text_col:
                 row[col] = data["interpol_info"]
-
             elif col == "is_archived":
                 row[col] = False
             elif col == "is_deleted":
@@ -2176,9 +2013,7 @@ class MainWindow(QMainWindow):
         self._save_state()
         self.apply_all_filters()
 
-    # --------------------------------------------------------
-    #                     ОПЕРАЦІЇ З РЯДКАМИ
-    # --------------------------------------------------------
+    # -------------------- операции с рядами --------------------
 
     def move_selected_to_archive(self):
         idxs = self.get_selected_indices()
@@ -2207,7 +2042,6 @@ class MainWindow(QMainWindow):
             return
         self.df_original.loc[idxs, "is_deleted"] = True
         self._save_state()
-        # пересчёт дубликатов: если один экземпляр ушёл в "Видалені", оставшийся не считается дубликатом
         self.recalc_duplicate_marks(show_popup=False)
         self.apply_all_filters()
 
@@ -2221,22 +2055,9 @@ class MainWindow(QMainWindow):
         self.recalc_duplicate_marks(show_popup=False)
         self.apply_all_filters()
 
-    # --------------------------------------------------------
-    #            ПЕРЕМИКАЧ "ПОКАЗАТИ СТРОКИ, ЩО СПЛИВАЮТЬ"
-    # --------------------------------------------------------
-
-    def on_toggle_show_expiring(self, checked: bool):
-        self.show_only_expiring = checked
-        self.apply_all_filters()
-
-    # --------------------------------------------------------
-    #              КНОПКА "ПЕРЕВІРИТИ ДУБЛІКАТИ"
-    # --------------------------------------------------------
+    # -------------------- дублікати кнопкой --------------------
 
     def on_check_duplicates_clicked(self):
-        """
-        Явный пересчёт дубликатов по ПІБ с показом попапа.
-        """
         old_count = len(self.duplicate_indices)
         self.recalc_duplicate_marks(show_popup=False)
         new_count = len(self.duplicate_indices)
@@ -2244,28 +2065,17 @@ class MainWindow(QMainWindow):
         self.apply_all_filters()
 
         if new_count == 0:
-            QMessageBox.information(
-                self,
-                "Дублікати",
-                "Дублікати за ПІБ не виявлено.",
-            )
+            QMessageBox.information(self, "Дублікати", "Дублікати за ПІБ не виявлено.")
         else:
-            msg = (
-                f"Виявлено {new_count} запис(ів)-дублікат(ів) за ПІБ.\n"
-                f"(Рядки виділені жовтим фоном у таблиці.)"
-            )
-            # если стало меньше, чем было — тоже скажем
+            msg = f"Виявлено {new_count} запис(ів)-дублікат(ів) за ПІБ.\n(Рядки підсвічені синім фоном.)"
             if new_count < old_count:
                 msg += "\nЧастину дублікатів, ймовірно, було перенесено до 'Видалені'."
             QMessageBox.information(self, "Дублікати", msg)
 
-    # --------------------------------------------------------
-    #                        ЕКСПОРТ
-    # --------------------------------------------------------
+    # -------------------- экспорт --------------------
 
     def _format_df_for_export(self, df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
-        # Убираем служебные колонки
         for c in SERVICE_COLS:
             if c in out.columns:
                 out = out.drop(columns=[c])
@@ -2282,9 +2092,7 @@ class MainWindow(QMainWindow):
             return
 
         path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Зберегти результати фільтрації",
-            "",
+            self, "Зберегти результати фільтрації", "",
             "Word (*.docx);;Excel (*.xlsx);;CSV (*.csv)"
         )
         if not path:
@@ -2295,8 +2103,6 @@ class MainWindow(QMainWindow):
 
             if path.lower().endswith(".docx") or "Word" in selected_filter:
                 doc = Document()
-
-                # Альбомна орієнтація
                 section = doc.sections[0]
                 section.orientation = WD_ORIENT.LANDSCAPE
                 new_width, new_height = section.page_height, section.page_width
@@ -2327,9 +2133,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Помилка експорту", str(e))
 
-    # --------------------------------------------------------
-    #            ВІКНО АНАЛІЗУ ЗБІГІВ
-    # --------------------------------------------------------
+    # -------------------- матчинг диалог --------------------
 
     def open_match_dialog(self):
         if self.df_original is None:
@@ -2346,7 +2150,6 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
 
-    # Светлая тема
     app.setStyleSheet("""
         QWidget {
             background-color: #f2f2f2;
